@@ -5,9 +5,6 @@ Implements FedAvg (baseline) and FedProx (Non-IID optimisation)
 as outlined in: "Optimising Federated Learning Based Intrusion Detection
 for IoT Systems" — Sakshi Mahajan, MSc CS (Data Analytics), Uni. of Galway
 
-FedProx Reference:
-  Li et al. (2020). "Federated Optimization in Heterogeneous Networks."
-  MLSys 2020. https://arxiv.org/abs/1812.06127
 """
 
 import os
@@ -38,7 +35,7 @@ from pathlib import Path
 # or Kaggle: https://www.kaggle.com/datasets/mkashifn/nbaiot-dataset
 #
 # Set DATASET_ROOT below to your local path:
-DATASET_ROOT = Path(".Datasets/N-BaIoT")
+DATASET_ROOT = Path("N-BaIoT")
 
 # Known device folder names in the N-BaIoT dataset
 DEVICE_FOLDERS = [
@@ -93,6 +90,28 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
     return combined
 
 
+def load_flat_device_data(dataset_root: Path, device_id: str) -> pd.DataFrame:
+    """
+    Loads flat N-BaIoT CSV files that are named like `1.benign.csv`.
+
+    The workspace copy of the dataset is stored in this layout, so we group
+    files by device prefix and infer the label from the filename.
+    """
+    dfs = []
+    for csv_file in sorted(dataset_root.glob(f"{device_id}.*.csv")):
+        label = 0 if ".benign." in csv_file.name else 1
+        df = pd.read_csv(csv_file)
+        df["label"] = label
+        dfs.append(df)
+
+    if not dfs:
+        raise FileNotFoundError(f"No CSV files found for device {device_id} under {dataset_root}")
+
+    combined = pd.concat(dfs, ignore_index=True)
+    combined = combined.dropna()
+    return combined
+
+
 def load_nbaiot_federated(
     dataset_root: Path = DATASET_ROOT,
     max_samples_per_device: int = 5000,
@@ -116,13 +135,21 @@ def load_nbaiot_federated(
     idx = 0
 
     available_devices = []
-    for device_name in DEVICE_FOLDERS:
-        device_path = dataset_root / device_name
-        if device_path.exists():
+    folder_devices = [device_name for device_name in DEVICE_FOLDERS if (dataset_root / device_name).exists()]
+    flat_device_ids = sorted(
+        {
+            csv_file.stem.split(".", 1)[0]
+            for csv_file in dataset_root.glob("*.csv")
+            if csv_file.stem.split(".", 1)[0].isdigit()
+        }
+    )
+
+    if folder_devices:
+        for device_name in folder_devices:
+            device_path = dataset_root / device_name
             available_devices.append(device_name)
             try:
                 df = load_device_data(device_path)
-                # Cap samples per device to keep training manageable
                 if len(df) > max_samples_per_device:
                     df = df.sample(n=max_samples_per_device, random_state=random_state)
                 start = idx
@@ -134,6 +161,23 @@ def load_nbaiot_federated(
                       f"{(df['label'] == 1).sum():,} attack)")
             except Exception as e:
                 print(f"  WARNING: Could not load {device_name}: {e}")
+    elif flat_device_ids:
+        for device_id in flat_device_ids:
+            client_name = f"Device_{device_id}"
+            available_devices.append(client_name)
+            try:
+                df = load_flat_device_data(dataset_root, device_id)
+                if len(df) > max_samples_per_device:
+                    df = df.sample(n=max_samples_per_device, random_state=random_state)
+                start = idx
+                all_data.append(df)
+                idx += len(df)
+                client_indices.append((client_name, start, idx))
+                print(f"  Loaded {client_name}: {len(df):,} samples "
+                      f"({(df['label'] == 0).sum():,} benign, "
+                      f"{(df['label'] == 1).sum():,} attack)")
+            except Exception as e:
+                print(f"  WARNING: Could not load {client_name}: {e}")
 
     if not all_data:
         raise RuntimeError(
