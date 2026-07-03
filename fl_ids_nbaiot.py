@@ -20,21 +20,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from pathlib import Path
 
-
-# =============================================================================
-# 1. DATASET LOADING — N-BaIoT
-# =============================================================================
-# N-BaIoT dataset structure:
-#   Each IoT device has its own folder (e.g. Danmini_Doorbell, Ecobee_Thermostat…)
-#   Each folder contains:
-#       benign/           — normal traffic CSVs
-#       mirai_attacks/    — Mirai botnet attack CSVs  (gafgyt_attacks/ for Gafgyt)
-#       gafgyt_attacks/   — Gafgyt botnet attack CSVs
-#
-# Download from: https://archive.ics.uci.edu/ml/datasets/detection_of_IoT_botnet_attacks_N_BaIoT
-# or Kaggle: https://www.kaggle.com/datasets/mkashifn/nbaiot-dataset
-#
-# Set DATASET_ROOT below to your local path:
+# DATASET LOADING — N-BaIoT
 DATASET_ROOT = Path("N-BaIoT")
 
 # Known device folder names in the N-BaIoT dataset
@@ -58,7 +44,7 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
     """
     dfs = []
 
-    # --- Benign traffic ---
+    # Benign traffic
     benign_dir = device_path / "benign"
     if benign_dir.exists():
         for csv_file in benign_dir.glob("*.csv"):
@@ -66,7 +52,7 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
             df["label"] = 0
             dfs.append(df)
 
-    # --- Attack traffic (Mirai) ---
+    # Attack traffic (Mirai)
     mirai_dir = device_path / "mirai_attacks"
     if mirai_dir.exists():
         for csv_file in mirai_dir.glob("*.csv"):
@@ -74,7 +60,7 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
             df["label"] = 1
             dfs.append(df)
 
-    # --- Attack traffic (Gafgyt) ---
+    # Attack traffic (Gafgyt)
     gafgyt_dir = device_path / "gafgyt_attacks"
     if gafgyt_dir.exists():
         for csv_file in gafgyt_dir.glob("*.csv"):
@@ -215,7 +201,8 @@ def load_nbaiot_federated(
 
 
 # =============================================================================
-# 2. DEMO / SYNTHETIC DATA (used when N-BaIoT is not yet downloaded)
+# 2. DEMO / SYNTHETIC DATA (i used it to test the code before the real dataset for
+#  quicker development and testing)
 # =============================================================================
 
 def make_synthetic_noniid_loaders(
@@ -236,7 +223,7 @@ def make_synthetic_noniid_loaders(
     np.random.seed(random_state)
     torch.manual_seed(random_state)
 
-    # Vary attack ratio per device (Non-IID: different distributions)
+    # Create attack ratios for each client (0.05 to 0.95)
     attack_ratios = np.linspace(0.05, 0.95, num_clients)
 
     train_loaders, test_loaders = [], []
@@ -366,7 +353,7 @@ def client_update_fedprox(
             # --- Task loss (cross-entropy) ---
             task_loss = criterion(client_model(data), target)
 
-            # --- Proximal term: penalise drift from global model ---
+            #  Proximal term: penalise drift from global model 
             # ||w_local - w_global||^2  (summed across all parameters)
             prox_loss = torch.tensor(0.0)
             for name, param in client_model.named_parameters():
@@ -543,7 +530,6 @@ def run_federated_learning(
 def main():
     # ------------------------------------------------------------------
     # Dataset loading
-    # Try real N-BaIoT first; fall back to synthetic Non-IID data
     # ------------------------------------------------------------------
     use_real_data = DATASET_ROOT.exists()
 
