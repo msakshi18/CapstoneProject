@@ -14,7 +14,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
@@ -116,11 +120,10 @@ def load_nbaiot_federated(
         scaler         — fitted StandardScaler (save for inference)
     """
     print("Loading N-BaIoT dataset...")
-    all_data = []
-    client_indices = []  # track which rows belong to which device
-    idx = 0
+    train_features, train_labels = [], []
+    test_features, test_labels = [], []
+    client_names = []
 
-    available_devices = []
     folder_devices = [device_name for device_name in DEVICE_FOLDERS if (dataset_root / device_name).exists()]
     flat_device_ids = sorted(
         {
@@ -133,15 +136,24 @@ def load_nbaiot_federated(
     if folder_devices:
         for device_name in folder_devices:
             device_path = dataset_root / device_name
-            available_devices.append(device_name)
             try:
                 df = load_device_data(device_path)
                 if len(df) > max_samples_per_device:
                     df = df.sample(n=max_samples_per_device, random_state=random_state)
-                start = idx
-                all_data.append(df)
-                idx += len(df)
-                client_indices.append((device_name, start, idx))
+                X_dev = df.iloc[:, :-1].values.astype(np.float32)
+                y_dev = df["label"].values.astype(np.int64)
+                X_tr, X_te, y_tr, y_te = train_test_split(
+                    X_dev,
+                    y_dev,
+                    test_size=test_size,
+                    random_state=random_state,
+                    stratify=y_dev,
+                )
+                client_names.append(device_name)
+                train_features.append(X_tr)
+                train_labels.append(y_tr)
+                test_features.append(X_te)
+                test_labels.append(y_te)
                 print(f"  Loaded {device_name}: {len(df):,} samples "
                       f"({(df['label'] == 0).sum():,} benign, "
                       f"{(df['label'] == 1).sum():,} attack)")
@@ -150,44 +162,48 @@ def load_nbaiot_federated(
     elif flat_device_ids:
         for device_id in flat_device_ids:
             client_name = f"Device_{device_id}"
-            available_devices.append(client_name)
             try:
                 df = load_flat_device_data(dataset_root, device_id)
                 if len(df) > max_samples_per_device:
                     df = df.sample(n=max_samples_per_device, random_state=random_state)
-                start = idx
-                all_data.append(df)
-                idx += len(df)
-                client_indices.append((client_name, start, idx))
+                X_dev = df.iloc[:, :-1].values.astype(np.float32)
+                y_dev = df["label"].values.astype(np.int64)
+                X_tr, X_te, y_tr, y_te = train_test_split(
+                    X_dev,
+                    y_dev,
+                    test_size=test_size,
+                    random_state=random_state,
+                    stratify=y_dev,
+                )
+                client_names.append(client_name)
+                train_features.append(X_tr)
+                train_labels.append(y_tr)
+                test_features.append(X_te)
+                test_labels.append(y_te)
                 print(f"  Loaded {client_name}: {len(df):,} samples "
                       f"({(df['label'] == 0).sum():,} benign, "
                       f"{(df['label'] == 1).sum():,} attack)")
             except Exception as e:
                 print(f"  WARNING: Could not load {client_name}: {e}")
 
-    if not all_data:
+    if not train_features:
         raise RuntimeError(
             f"No N-BaIoT data found at '{dataset_root}'.\n"
             "Please download the dataset and set DATASET_ROOT correctly."
         )
 
-    full_df = pd.concat(all_data, ignore_index=True)
-    X = full_df.iloc[:, :-1].values.astype(np.float32)  # 115 features
-    y = full_df["label"].values.astype(np.int64)
-
-    # Fit scaler on ALL data (global normalisation)
+    # Fit scaler on TRAINING data only to avoid leakage into the test split.
+    X_train_all = np.vstack(train_features)
     scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    scaler.fit(X_train_all)
 
     train_loaders, test_loaders = [], []
 
-    for device_name, start, end in client_indices:
-        X_dev = X[start:end]
-        y_dev = y[start:end]
-
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X_dev, y_dev, test_size=test_size, random_state=random_state, stratify=y_dev
-        )
+    for device_name, X_tr, y_tr, X_te, y_te in zip(
+        client_names, train_features, train_labels, test_features, test_labels
+    ):
+        X_tr = scaler.transform(X_tr)
+        X_te = scaler.transform(X_te)
 
         train_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
         test_ds  = TensorDataset(torch.tensor(X_te),  torch.tensor(y_te))
@@ -196,8 +212,55 @@ def load_nbaiot_federated(
         test_loaders.append(DataLoader(test_ds,  batch_size=64, shuffle=False))
 
     print(f"\nTotal clients (devices): {len(train_loaders)}")
-    print(f"Feature dimensions    : {X.shape[1]}")
+    print(f"Feature dimensions    : {X_train_all.shape[1]}")
     return train_loaders, test_loaders, scaler
+
+
+def split_train_validation_loaders(
+    train_loaders: list[DataLoader],
+    val_split: float = 0.2,
+    random_state: int = 42,
+) -> tuple[list[DataLoader], list[DataLoader]]:
+    """
+    Split each client's training dataset into a train subset and a validation subset.
+
+    This keeps the test loaders untouched while giving the FL loop a validation
+    signal for early stopping.
+    """
+    if not 0.0 < val_split < 1.0:
+        raise ValueError("val_split must be between 0 and 1")
+
+    train_sub_loaders = []
+    val_loaders = []
+
+    for client_idx, loader in enumerate(train_loaders):
+        dataset = loader.dataset
+        dataset_size = len(dataset)
+
+        if dataset_size < 2:
+            train_sub_loaders.append(loader)
+            val_loaders.append(DataLoader(dataset, batch_size=loader.batch_size or 64, shuffle=False))
+            continue
+
+        val_size = max(1, int(dataset_size * val_split))
+        train_size = dataset_size - val_size
+        if train_size < 1:
+            train_size = dataset_size - 1
+            val_size = 1
+
+        generator = torch.Generator().manual_seed(random_state + client_idx)
+        permutation = torch.randperm(dataset_size, generator=generator).tolist()
+        train_indices = permutation[:train_size]
+        val_indices = permutation[train_size:]
+
+        train_subset = Subset(dataset, train_indices)
+        val_subset = Subset(dataset, val_indices)
+
+        batch_size = loader.batch_size or 64
+        train_sub_loaders.append(DataLoader(train_subset, batch_size=batch_size, shuffle=True))
+        val_loaders.append(DataLoader(val_subset, batch_size=batch_size, shuffle=False))
+
+    return train_sub_loaders, val_loaders
 
 
 # =============================================================================
@@ -458,6 +521,9 @@ def run_federated_learning(
     lr: float = 0.005,
     weight_decay: float = 1e-4,
     mu: float = 0.01,                  # FedProx only — proximal coefficient
+    val_split: float = 0.2,
+    patience: int = 3,
+    min_delta: float = 1e-4,
     device_names: list[str] | None = None,
 ) -> tuple[nn.Module, list[float]]:
     """
@@ -479,10 +545,18 @@ def run_federated_learning(
     print(f"  Weight decay: {weight_decay}")
     if algorithm == "fedprox":
         print(f"  Mu (μ)     : {mu}  (proximal coefficient)")
+    print(f"  Val split  : {val_split}  |  Patience: {patience}")
     print(f"{'='*60}")
+
+    train_loaders, val_loaders = split_train_validation_loaders(
+        train_loaders, val_split=val_split
+    )
 
     global_model = SimpleMLP(input_size, hidden_size, num_classes)
     accuracy_history = []
+    best_val_accuracy = float("-inf")
+    best_model_state = copy.deepcopy(global_model.state_dict())
+    stale_rounds = 0
 
     for round_idx in range(num_rounds):
         client_weights = []
@@ -514,17 +588,72 @@ def run_federated_learning(
         global_model = server_aggregate(global_model, client_weights, client_sizes)
 
         # Evaluate after this round
+        print(f"\nRound {round_idx + 1}/{num_rounds} — Validation accuracy:")
+        val_results = evaluate_global_model(global_model, val_loaders, device_names)
+        val_accuracy = val_results["overall_accuracy"]
+
+        if val_accuracy > best_val_accuracy + min_delta:
+            best_val_accuracy = val_accuracy
+            best_model_state = copy.deepcopy(global_model.state_dict())
+            stale_rounds = 0
+        else:
+            stale_rounds += 1
+
         print(f"\nRound {round_idx + 1}/{num_rounds} — Per-client accuracy:")
         results = evaluate_global_model(global_model, test_loaders, device_names)
         overall = results["overall_accuracy"]
         accuracy_history.append(overall)
         print(f"  >> Overall accuracy: {overall:.4f}")
 
+        if stale_rounds >= patience:
+            print(
+                f"\nEarly stopping triggered after {round_idx + 1} rounds: "
+                f"validation accuracy did not improve for {patience} rounds."
+            )
+            break
+
+    global_model.load_state_dict(best_model_state)
+
     return global_model, accuracy_history
+
+# =============================================================================
+# 9. PLOTTING CONVERGENCE
+# =============================================================================
+
+def plot_convergence(
+    fedavg_history: list[float],
+    fedprox_history: list[float],
+    save_path: str = "convergence_comparison.png",
+) -> Path:
+    """
+    Plot round-by-round convergence for FedAvg and FedProx.
+
+    Saves the figure to disk so it can be inspected even when running in a
+    headless terminal session.
+    """
+    rounds = range(1, max(len(fedavg_history), len(fedprox_history)) + 1)
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(range(1, len(fedavg_history) + 1), fedavg_history, marker="o", linewidth=2, label="FedAvg")
+    plt.plot(range(1, len(fedprox_history) + 1), fedprox_history, marker="s", linewidth=2, label="FedProx")
+    plt.title("Federated Convergence Comparison")
+    plt.xlabel("Communication Round")
+    plt.ylabel("Overall Accuracy")
+    plt.xticks(list(rounds))
+    plt.ylim(0.0, 1.0)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+
+    output_path = Path(save_path)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"\nConvergence plot saved to: {output_path.resolve()}")
+    return output_path
 
 
 # =============================================================================
-# 9. MAIN — COMPARE FedAvg vs FedProx
+# 10. MAIN — COMPARE FedAvg vs FedProx
 # =============================================================================
 
 def main():
@@ -566,9 +695,9 @@ def main():
         input_size   = input_size,
         hidden_size  = 32,
         num_classes  = 2,
-        num_rounds   = 10,
-        local_epochs = 1,
-        lr           = 0.005,
+        num_rounds   = 8,
+        local_epochs = 2,
+        lr           = 0.001,
         weight_decay = 1e-4,
     )
 
@@ -591,7 +720,7 @@ def main():
         train_loaders=train_loaders,
         test_loaders=test_loaders,
         device_names=device_names,
-        mu=0.01,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
+        mu=0.001,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
         **CONFIG,
     )
 
@@ -611,6 +740,11 @@ def main():
     print(f"  {'Round':<8} {'FedAvg':>10} {'FedProx':>10}")
     for r, (fa, fp) in enumerate(zip(fedavg_acc, fedprox_acc), 1):
         print(f"  {r:<8} {fa:>10.4f} {fp:>10.4f}")
+
+    # ------------------------------------------------------------------
+    # Convergence plot
+    # ------------------------------------------------------------------
+    plot_convergence(fedavg_acc, fedprox_acc)
 
     # ------------------------------------------------------------------
     # Detailed classification report on final global models
