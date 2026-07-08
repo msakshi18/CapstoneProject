@@ -24,6 +24,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.feature_selection import SelectKBest, chi2
+from scipy.spatial import cKDTree
 from pathlib import Path
 
 # DATASET LOADING — N-BaIoT
@@ -41,6 +42,115 @@ DEVICE_FOLDERS = [
     "SimpleHome_XCS7_1002_WHT_Security_Camera",
     "SimpleHome_XCS7_1003_WHT_Security_Camera",
 ]
+
+
+def _split_device(
+    X: np.ndarray,
+    y: np.ndarray,
+    test_size: float,
+    random_state: int,
+    split_strategy: str = "random",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Splits one device's data into train/test.
+
+    split_strategy:
+      "random" — the original behaviour: sklearn's stratified random split.
+                 If the underlying CSV rows are temporally adjacent capture
+                 windows, a random split can place near-identical rows from
+                 the same attack burst on both sides — this is the N-BaIoT
+                 leakage pattern.
+      "time"   — takes the CSV's row order as a time axis: the first
+                 (1 - test_size) fraction of rows become train, the last
+                 fraction become test, with NO shuffling. This keeps whole
+                 attack bursts on one side of the split, which is the
+                 standard fix for this kind of leakage.
+    """
+    if split_strategy == "time":
+        n = len(X)
+        split_at = int(n * (1 - test_size))
+        return X[:split_at], X[split_at:], y[:split_at], y[split_at:]
+    return train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+
+
+def check_train_test_leakage(
+    train_features: list[np.ndarray],
+    test_features: list[np.ndarray],
+    client_names: list[str],
+    near_dup_distance: float = 1e-3,
+    max_test_samples_checked: int = 3000,
+    random_state: int = 42,
+) -> dict:
+    """
+    Per-device leakage check between a client's train and test split.
+
+    Reports, for each device:
+      - exact duplicate rows appearing in both train and test
+      - near-duplicate rows: test rows whose nearest neighbour in the
+        train set is within `near_dup_distance` (raw, unscaled feature
+        space). This is the specific N-BaIoT leakage pattern — consecutive
+        flow-capture windows during the same attack burst produce near-
+        identical statistical features, so a random split can leak an
+        almost-identical row across the split.
+
+    Uses a KD-tree per device so this stays fast even on large clients;
+    test rows are subsampled if there are more than `max_test_samples_checked`.
+    A near-duplicate rate above ~5% is a strong signal that reported
+    accuracy is inflated by leakage rather than genuine generalisation.
+    """
+    print("\n" + "=" * 60)
+    print("  TRAIN/TEST LEAKAGE CHECK")
+    print("=" * 60)
+    rng = np.random.RandomState(random_state)
+    report = {}
+
+    for name, X_tr, X_te in zip(client_names, train_features, test_features):
+        if len(X_tr) == 0 or len(X_te) == 0:
+            continue
+
+        # Exact duplicates: hash each row, check membership.
+        train_row_set = {tuple(row) for row in X_tr}
+        exact_dupes = sum(1 for row in X_te if tuple(row) in train_row_set)
+
+        # Near-duplicates via nearest-neighbour distance.
+        if len(X_te) > max_test_samples_checked:
+            sample_idx = rng.choice(len(X_te), max_test_samples_checked, replace=False)
+            test_sample = X_te[sample_idx]
+        else:
+            test_sample = X_te
+
+        tree = cKDTree(X_tr)
+        dists, _ = tree.query(test_sample, k=1)
+        near_dupes = int((dists < near_dup_distance).sum())
+        near_dupe_rate = near_dupes / len(test_sample)
+
+        report[name] = {
+            "exact_duplicates": exact_dupes,
+            "test_rows_checked": len(test_sample),
+            "near_duplicates": near_dupes,
+            "near_duplicate_rate": near_dupe_rate,
+        }
+
+        flag = ""
+        if exact_dupes > 0 or near_dupe_rate > 0.05:
+            flag = "  <-- LIKELY LEAKAGE"
+        print(f"    {name:<45} exact: {exact_dupes:>4}  |  near-dupes: {near_dupes:>4}/{len(test_sample)} "
+              f"({near_dupe_rate:.1%}){flag}")
+
+    total_near = sum(r["near_duplicates"] for r in report.values())
+    total_checked = sum(r["test_rows_checked"] for r in report.values())
+    total_exact = sum(r["exact_duplicates"] for r in report.values())
+    overall_rate = total_near / total_checked if total_checked else 0.0
+    print(f"\n  Overall: {total_exact} exact duplicates, "
+          f"{total_near}/{total_checked} near-duplicates ({overall_rate:.1%})")
+    if total_exact > 0 or overall_rate > 0.05:
+        print("  -> Meaningful leakage risk. Consider split_strategy='time' or "
+              "leave-one-device-out evaluation before trusting accuracy numbers.")
+    else:
+        print("  -> No strong leakage signal from this check.")
+    return report
 
 
 def load_device_data(device_path: Path) -> pd.DataFrame:
@@ -79,6 +189,19 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
 
     combined = pd.concat(dfs, ignore_index=True)
     combined = combined.dropna()
+
+    # N-BaIoT's raw CSVs contain genuine duplicate flow-statistic rows
+    # (not just near-duplicates from adjacent capture windows). If these
+    # survive into both the train and test split, the model "generalizes"
+    # by recognising rows it was literally trained on. Dedup here, before
+    # any split, so duplicates can't land on both sides.
+    n_before = len(combined)
+    combined = combined.drop_duplicates()
+    n_dropped = n_before - len(combined)
+    if n_dropped > 0:
+        print(f"    Dropped {n_dropped:,} exact-duplicate rows "
+              f"({100 * n_dropped / n_before:.1f}% of {device_path.name})")
+
     return combined
 
 
@@ -101,6 +224,16 @@ def load_flat_device_data(dataset_root: Path, device_id: str) -> pd.DataFrame:
 
     combined = pd.concat(dfs, ignore_index=True)
     combined = combined.dropna()
+
+    # Same rationale as load_device_data: drop exact-duplicate rows before
+    # any split so they can't leak across train/test.
+    n_before = len(combined)
+    combined = combined.drop_duplicates()
+    n_dropped = n_before - len(combined)
+    if n_dropped > 0:
+        print(f"    Dropped {n_dropped:,} exact-duplicate rows "
+              f"({100 * n_dropped / n_before:.1f}% of device {device_id})")
+
     return combined
 
 
@@ -110,6 +243,8 @@ def load_nbaiot_federated(
     test_size: float = 0.2,
     random_state: int = 42,
     k_best_features: int | None = 40,
+    split_strategy: str = "random",
+    check_leakage: bool = True,
 ) -> tuple[list[DataLoader], list[DataLoader], StandardScaler, list[int]]:
     """
     Loads N-BaIoT data and partitions it into per-device (Non-IID) FL clients.
@@ -142,15 +277,14 @@ def load_nbaiot_federated(
             try:
                 df = load_device_data(device_path)
                 if len(df) > max_samples_per_device:
-                    df = df.sample(n=max_samples_per_device, random_state=random_state)
+                    if split_strategy == "time":
+                        df = df.iloc[:max_samples_per_device]  # keep native row order intact
+                    else:
+                        df = df.sample(n=max_samples_per_device, random_state=random_state)
                 X_dev = df.iloc[:, :-1].values.astype(np.float32)
                 y_dev = df["label"].values.astype(np.int64)
-                X_tr, X_te, y_tr, y_te = train_test_split(
-                    X_dev,
-                    y_dev,
-                    test_size=test_size,
-                    random_state=random_state,
-                    stratify=y_dev,
+                X_tr, X_te, y_tr, y_te = _split_device(
+                    X_dev, y_dev, test_size, random_state, split_strategy
                 )
                 client_names.append(device_name)
                 train_features.append(X_tr)
@@ -168,15 +302,14 @@ def load_nbaiot_federated(
             try:
                 df = load_flat_device_data(dataset_root, device_id)
                 if len(df) > max_samples_per_device:
-                    df = df.sample(n=max_samples_per_device, random_state=random_state)
+                    if split_strategy == "time":
+                        df = df.iloc[:max_samples_per_device]  # keep native row order intact
+                    else:
+                        df = df.sample(n=max_samples_per_device, random_state=random_state)
                 X_dev = df.iloc[:, :-1].values.astype(np.float32)
                 y_dev = df["label"].values.astype(np.int64)
-                X_tr, X_te, y_tr, y_te = train_test_split(
-                    X_dev,
-                    y_dev,
-                    test_size=test_size,
-                    random_state=random_state,
-                    stratify=y_dev,
+                X_tr, X_te, y_tr, y_te = _split_device(
+                    X_dev, y_dev, test_size, random_state, split_strategy
                 )
                 client_names.append(client_name)
                 train_features.append(X_tr)
@@ -218,6 +351,9 @@ def load_nbaiot_federated(
         train_features = [X[:, selected_idx] for X in train_features]
         test_features  = [X[:, selected_idx] for X in test_features]
         X_train_all = np.vstack(train_features)
+
+    if check_leakage:
+        check_train_test_leakage(train_features, test_features, client_names)
 
     scaler = StandardScaler()
     scaler.fit(X_train_all)
@@ -527,6 +663,7 @@ def evaluate_global_model(
     global_model: nn.Module,
     test_loaders: list[DataLoader],
     device_names: list[str] | None = None,
+    verbose: bool = True,
 ) -> dict:
     """
     Evaluates the global model on each client's local test set.
@@ -554,7 +691,8 @@ def evaluate_global_model(
             all_targets.extend(targets_c)
 
             name = device_names[i] if device_names else f"Client {i+1}"
-            print(f"    {name:<45} Acc: {acc:.4f}")
+            if verbose:
+                print(f"    {name:<45} Acc: {acc:.4f}")
 
     overall_acc = sum(p == t for p, t in zip(all_preds, all_targets)) / len(all_targets)
     return {
@@ -589,7 +727,7 @@ def run_federated_learning(
     conditional_update_delta: float = 0.0,  # Skip an update if local loss doesn't improve by at least this much
     quantize_updates: bool = False,    # Simulate uplink compression (float32 -> float16)
     random_state: int = 42,
-) -> tuple[nn.Module, list[float]]:
+) -> tuple[nn.Module, list[float], list[float]]:
     """
     Main federated learning loop.
 
@@ -618,6 +756,7 @@ def run_federated_learning(
 
     global_model = SimpleMLP(input_size, hidden_size, num_classes)
     accuracy_history = []
+    train_accuracy_history = []
     best_val_accuracy = float("-inf")
     best_model_state = copy.deepcopy(global_model.state_dict())
     stale_rounds = 0
@@ -710,7 +849,16 @@ def run_federated_learning(
         results = evaluate_global_model(global_model, test_loaders, device_names)
         overall = results["overall_accuracy"]
         accuracy_history.append(overall)
-        print(f"  >> Overall accuracy: {overall:.4f}")
+
+        # Train-side accuracy (same clients' train_loaders, silent) — the gap
+        # between this and `overall` (test) is the actual overfitting signal.
+        # A flat test curve alone (like the round-by-round print above) does
+        # NOT show overfitting on its own.
+        train_results = evaluate_global_model(global_model, train_loaders, device_names, verbose=False)
+        train_accuracy_history.append(train_results["overall_accuracy"])
+
+        print(f"  >> Overall accuracy: {overall:.4f}  (train: {train_results['overall_accuracy']:.4f}, "
+              f"gap: {train_results['overall_accuracy'] - overall:+.4f})")
 
         if stale_rounds >= patience:
             print(
@@ -721,7 +869,7 @@ def run_federated_learning(
 
     global_model.load_state_dict(best_model_state)
 
-    return global_model, accuracy_history
+    return global_model, accuracy_history, train_accuracy_history
 
 # =============================================================================
 # 8b. MODEL PRUNING & EDGE-DEVICE BENCHMARK (Lightweight Model Design)
@@ -808,10 +956,18 @@ def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
 def plot_convergence(
     fedavg_history: list[float],
     fedprox_history: list[float],
+    fedavg_train_history: list[float] | None = None,
+    fedprox_train_history: list[float] | None = None,
     save_path: str = "convergence_comparison.png",
 ) -> Path:
     """
     Plot round-by-round convergence for FedAvg and FedProx.
+
+    If train-accuracy histories are supplied, they're plotted as dashed
+    lines alongside the test curves — the gap between dashed (train) and
+    solid (test) is the actual overfitting signal. A flat test curve on
+    its own does not show overfitting; it only shows the model reached a
+    plateau, which can equally mean underfitting or a low learning rate.
 
     Saves the figure to disk so it can be inspected even when running in a
     headless terminal session.
@@ -819,8 +975,14 @@ def plot_convergence(
     rounds = range(1, max(len(fedavg_history), len(fedprox_history)) + 1)
 
     plt.figure(figsize=(9, 5))
-    plt.plot(range(1, len(fedavg_history) + 1), fedavg_history, marker="o", linewidth=2, label="FedAvg")
-    plt.plot(range(1, len(fedprox_history) + 1), fedprox_history, marker="s", linewidth=2, label="FedProx")
+    plt.plot(range(1, len(fedavg_history) + 1), fedavg_history, marker="o", linewidth=2, label="FedAvg (test)", color="tab:blue")
+    plt.plot(range(1, len(fedprox_history) + 1), fedprox_history, marker="s", linewidth=2, label="FedProx (test)", color="tab:orange")
+    if fedavg_train_history:
+        plt.plot(range(1, len(fedavg_train_history) + 1), fedavg_train_history,
+                  linestyle="--", linewidth=1.5, label="FedAvg (train)", color="tab:blue", alpha=0.6)
+    if fedprox_train_history:
+        plt.plot(range(1, len(fedprox_train_history) + 1), fedprox_train_history,
+                  linestyle="--", linewidth=1.5, label="FedProx (train)", color="tab:orange", alpha=0.6)
     plt.title("Federated Convergence Comparison")
     plt.xlabel("Communication Round")
     plt.ylabel("Overall Accuracy")
@@ -851,12 +1013,21 @@ def main():
     # goal: 115 raw N-BaIoT features -> a smaller chi-squared-selected subset.
     K_BEST_FEATURES = 40
 
+    # SPLIT_STRATEGY controls the leakage investigation:
+    #   "random" — original behaviour (stratified random split per device)
+    #   "time"   — chronological split (first rows = train, last = test,
+    #              no shuffling) — the standard fix if check_train_test_leakage
+    #              below reports meaningful near-duplicate rates under "random"
+    SPLIT_STRATEGY = "random"
+
     if use_real_data:
         print("Real N-BaIoT dataset found — loading...")
         train_loaders, test_loaders, scaler, selected_idx = load_nbaiot_federated(
             dataset_root=DATASET_ROOT,
             max_samples_per_device=5000,
             k_best_features=K_BEST_FEATURES,
+            split_strategy=SPLIT_STRATEGY,
+            check_leakage=True,
         )
         # Build device name list matching the loaded order
         device_names = [
@@ -900,7 +1071,7 @@ def main():
         num_classes  = 2,
         num_rounds   = 8,
         local_epochs = 2,
-        lr           = 0.001,
+        lr           = 0.01,
         weight_decay = 1e-4,
         client_fraction = 0.7,
         conditional_update_delta = 1e-3,
@@ -910,7 +1081,7 @@ def main():
     # ------------------------------------------------------------------
     # Run FedAvg baseline
     # ------------------------------------------------------------------
-    fedavg_model, fedavg_acc = run_federated_learning(
+    fedavg_model, fedavg_acc, fedavg_train_acc = run_federated_learning(
         algorithm="fedavg",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
@@ -921,7 +1092,7 @@ def main():
     # ------------------------------------------------------------------
     # Run FedProx  (μ = 0.01 — good starting point for N-BaIoT)
     # ------------------------------------------------------------------
-    fedprox_model, fedprox_acc = run_federated_learning(
+    fedprox_model, fedprox_acc, fedprox_train_acc = run_federated_learning(
         algorithm="fedprox",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
@@ -936,8 +1107,10 @@ def main():
     print("\n" + "="*60)
     print("  FINAL RESULTS — FedAvg vs FedProx")
     print("="*60)
-    print(f"  FedAvg  final accuracy : {fedavg_acc[-1]:.4f}")
-    print(f"  FedProx final accuracy : {fedprox_acc[-1]:.4f}")
+    print(f"  FedAvg  final accuracy : {fedavg_acc[-1]:.4f}  (train: {fedavg_train_acc[-1]:.4f}, "
+          f"gap: {fedavg_train_acc[-1] - fedavg_acc[-1]:+.4f})")
+    print(f"  FedProx final accuracy : {fedprox_acc[-1]:.4f}  (train: {fedprox_train_acc[-1]:.4f}, "
+          f"gap: {fedprox_train_acc[-1] - fedprox_acc[-1]:+.4f})")
 
     improvement = (fedprox_acc[-1] - fedavg_acc[-1]) * 100
     sign = "+" if improvement >= 0 else ""
@@ -950,7 +1123,7 @@ def main():
     # ------------------------------------------------------------------
     # Convergence plot
     # ------------------------------------------------------------------
-    plot_convergence(fedavg_acc, fedprox_acc)
+    plot_convergence(fedavg_acc, fedprox_acc, fedavg_train_acc, fedprox_train_acc)
 
     # ------------------------------------------------------------------
     # Detailed classification report on final global models
