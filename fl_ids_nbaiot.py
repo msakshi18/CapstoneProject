@@ -14,14 +14,16 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.utils.prune as prune
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.feature_selection import SelectKBest, chi2
 from pathlib import Path
 
 # DATASET LOADING — N-BaIoT
@@ -107,7 +109,8 @@ def load_nbaiot_federated(
     max_samples_per_device: int = 5000,
     test_size: float = 0.2,
     random_state: int = 42,
-) -> tuple[list[DataLoader], list[DataLoader], StandardScaler]:
+    k_best_features: int | None = 40,
+) -> tuple[list[DataLoader], list[DataLoader], StandardScaler, list[int]]:
     """
     Loads N-BaIoT data and partitions it into per-device (Non-IID) FL clients.
 
@@ -192,8 +195,30 @@ def load_nbaiot_federated(
             "Please download the dataset and set DATASET_ROOT correctly."
         )
 
-    # Fit scaler on TRAINING data only to avoid leakage into the test split.
+    # Fit scaler/selector on TRAINING data only to avoid leakage into the test split.
     X_train_all = np.vstack(train_features)
+    y_train_all = np.concatenate(train_labels)
+
+    # ------------------------------------------------------------------
+    # Chi-squared feature selection (115 -> k_best_features)
+    # chi2 requires non-negative inputs, so we min-max scale first, select
+    # the top-k features on the *global* training pool, then z-score only
+    # the retained columns for the models. This is what shrinks the model
+    # for lightweight / Raspberry-Pi-class inference.
+    # ------------------------------------------------------------------
+    selected_idx = list(range(X_train_all.shape[1]))
+    if k_best_features is not None and k_best_features < X_train_all.shape[1]:
+        minmax = MinMaxScaler()
+        X_train_nonneg = minmax.fit_transform(X_train_all)
+        selector = SelectKBest(score_func=chi2, k=k_best_features)
+        selector.fit(X_train_nonneg, y_train_all)
+        selected_idx = np.where(selector.get_support())[0].tolist()
+        print(f"\nChi-squared feature selection: {X_train_all.shape[1]} -> {len(selected_idx)} features")
+
+        train_features = [X[:, selected_idx] for X in train_features]
+        test_features  = [X[:, selected_idx] for X in test_features]
+        X_train_all = np.vstack(train_features)
+
     scaler = StandardScaler()
     scaler.fit(X_train_all)
 
@@ -213,7 +238,7 @@ def load_nbaiot_federated(
 
     print(f"\nTotal clients (devices): {len(train_loaders)}")
     print(f"Feature dimensions    : {X_train_all.shape[1]}")
-    return train_loaders, test_loaders, scaler
+    return train_loaders, test_loaders, scaler, selected_idx
 
 
 def split_train_validation_loaders(
@@ -359,15 +384,23 @@ def client_update_fedavg(
     """Standard local training for FedAvg — no proximal term."""
     client_model.train()
     criterion = nn.CrossEntropyLoss()
+    initial_loss, final_loss = None, None
 
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        epoch_loss, n_batches = 0.0, 0
         for data, target in train_loader:
             optimizer.zero_grad()
             loss = criterion(client_model(data), target)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        epoch_loss /= max(n_batches, 1)
+        if epoch == 0:
+            initial_loss = epoch_loss
+        final_loss = epoch_loss
 
-    return client_model.state_dict()
+    return client_model.state_dict(), initial_loss, final_loss
 
 
 # =============================================================================
@@ -409,7 +442,10 @@ def client_update_fedprox(
         for name, param in global_model.named_parameters()
     }
 
-    for _ in range(epochs):
+    initial_loss, final_loss = None, None
+
+    for epoch in range(epochs):
+        epoch_loss, n_batches = 0.0, 0
         for data, target in train_loader:
             optimizer.zero_grad()
 
@@ -425,13 +461,37 @@ def client_update_fedprox(
             loss = task_loss + (mu / 2.0) * prox_loss
             loss.backward()
             optimizer.step()
+            epoch_loss += task_loss.item()
+            n_batches += 1
+        epoch_loss /= max(n_batches, 1)
+        if epoch == 0:
+            initial_loss = epoch_loss
+        final_loss = epoch_loss
 
-    return client_model.state_dict()
+    return client_model.state_dict(), initial_loss, final_loss
 
 
 # =============================================================================
 # 6. SERVER AGGREGATION — FedAvg (same for both algorithms)
 # =============================================================================
+
+def quantize_state_dict(state_dict: dict, dtype: torch.dtype = torch.float16) -> dict:
+    """
+    Simulates update compression for the uplink (client -> server transfer).
+
+    Casting the client's weight tensors to float16 halves the payload size
+    before "transmission". The server upcasts back to float32 before
+    aggregating, so training precision is unaffected — only the simulated
+    wire size changes. Returns the quantised dict plus nothing else; use
+    `state_dict_size_bytes` to measure the before/after payload.
+    """
+    return {k: v.to(dtype) for k, v in state_dict.items()}
+
+
+def state_dict_size_bytes(state_dict: dict) -> int:
+    """Rough payload size (bytes) of a state_dict, for compression reporting."""
+    return sum(v.element_size() * v.nelement() for v in state_dict.values())
+
 
 def server_aggregate(
     global_model: nn.Module,
@@ -525,6 +585,10 @@ def run_federated_learning(
     patience: int = 3,
     min_delta: float = 1e-4,
     device_names: list[str] | None = None,
+    client_fraction: float = 1.0,      # Client selection: fraction of clients sampled per round
+    conditional_update_delta: float = 0.0,  # Skip an update if local loss doesn't improve by at least this much
+    quantize_updates: bool = False,    # Simulate uplink compression (float32 -> float16)
+    random_state: int = 42,
 ) -> tuple[nn.Module, list[float]]:
     """
     Main federated learning loop.
@@ -559,10 +623,22 @@ def run_federated_learning(
     stale_rounds = 0
 
     for round_idx in range(num_rounds):
+        # ------------------------------------------------------------
+        # Client selection: sample a fraction of clients this round
+        # (mirrors real cross-device FL, e.g. "top 20 of 100 devices").
+        # With client_fraction=1.0 (default) all clients participate,
+        # matching the original 9-device behaviour.
+        # ------------------------------------------------------------
+        n_selected = max(1, int(round(num_clients * client_fraction)))
+        rng = np.random.RandomState(random_state + round_idx)
+        selected_clients = sorted(rng.choice(num_clients, size=n_selected, replace=False).tolist())
+
         client_weights = []
         client_sizes = []
+        skipped_clients = 0
+        bytes_before, bytes_after = 0, 0
 
-        for i in range(num_clients):
+        for i in selected_clients:
             client_model = copy.deepcopy(global_model)
             optimizer    = optim.SGD(
                 client_model.parameters(),
@@ -570,22 +646,53 @@ def run_federated_learning(
                 momentum=0.9,
                 weight_decay=weight_decay,
             )
-            client_sizes.append(len(train_loaders[i].dataset))
 
             if algorithm == "fedavg":
-                weights = client_update_fedavg(
+                weights, loss_before, loss_after = client_update_fedavg(
                     client_model, optimizer, train_loaders[i], epochs=local_epochs
                 )
             else:  # fedprox
-                weights = client_update_fedprox(
+                weights, loss_before, loss_after = client_update_fedprox(
                     client_model, global_model, optimizer, train_loaders[i],
                     epochs=local_epochs, mu=mu
                 )
 
-            client_weights.append(weights)
+            # ------------------------------------------------------------
+            # Conditional update: only ship this client's weights to the
+            # server if local loss improved by at least `conditional_update_delta`.
+            # Skipping stale/unhelpful updates cuts uplink traffic.
+            # ------------------------------------------------------------
+            improvement = (loss_before or 0.0) - (loss_after or 0.0)
+            if conditional_update_delta > 0 and improvement < conditional_update_delta:
+                skipped_clients += 1
+                continue
 
-        # Aggregate on server
-        global_model = server_aggregate(global_model, client_weights, client_sizes)
+            # ------------------------------------------------------------
+            # Update compression: simulate halving the payload with fp16
+            # before it goes "over the wire" to the server.
+            # ------------------------------------------------------------
+            bytes_before += state_dict_size_bytes(weights)
+            if quantize_updates:
+                weights = quantize_state_dict(weights)          # fp32 -> fp16 ("on the wire")
+                bytes_after += state_dict_size_bytes(weights)
+                weights = {k: v.float() for k, v in weights.items()}  # upcast back for aggregation
+            else:
+                bytes_after += state_dict_size_bytes(weights)
+
+            client_weights.append(weights)
+            client_sizes.append(len(train_loaders[i].dataset))
+
+        if skipped_clients:
+            print(f"  Conditional updates: {skipped_clients}/{len(selected_clients)} client(s) skipped (no sufficient local improvement)")
+        if quantize_updates and bytes_before:
+            print(f"  Update compression : {bytes_before/1024:.1f} KB -> {bytes_after/1024:.1f} KB "
+                  f"({100 * (1 - bytes_after / bytes_before):.0f}% smaller)")
+
+        if not client_weights:
+            print("  No client updates this round — keeping previous global model.")
+        else:
+            # Aggregate on server
+            global_model = server_aggregate(global_model, client_weights, client_sizes)
 
         # Evaluate after this round
         print(f"\nRound {round_idx + 1}/{num_rounds} — Validation accuracy:")
@@ -615,6 +722,84 @@ def run_federated_learning(
     global_model.load_state_dict(best_model_state)
 
     return global_model, accuracy_history
+
+# =============================================================================
+# 8b. MODEL PRUNING & EDGE-DEVICE BENCHMARK (Lightweight Model Design)
+# =============================================================================
+
+def prune_global_model(
+    model: nn.Module,
+    amount: float = 0.3,
+) -> nn.Module:
+    """
+    Magnitude-based unstructured pruning of every Linear layer.
+
+    Zeroes out the smallest-magnitude `amount` fraction of weights in each
+    Linear layer. The pruning mask stays registered (not yet "removed") so
+    that a subsequent fine-tuning pass can't undo the zeros — call
+    `finalize_pruning()` once fine-tuning is done to bake the mask in
+    permanently. This is what shrinks the effective parameter count for
+    Raspberry-Pi-class inference, per the "Lightweight Model Design" goal.
+    """
+    pruned = copy.deepcopy(model)
+    for module in pruned.net:
+        if isinstance(module, nn.Linear):
+            prune.l1_unstructured(module, name="weight", amount=amount)
+    return pruned
+
+
+def finalize_pruning(model: nn.Module) -> nn.Module:
+    """Bakes the pruning mask into the weights permanently (call after fine-tuning)."""
+    for module in model.net:
+        if isinstance(module, nn.Linear) and prune.is_pruned(module):
+            prune.remove(module, "weight")
+    return model
+
+
+def fine_tune(
+    model: nn.Module,
+    train_loaders: list[DataLoader],
+    epochs: int = 2,
+    lr: float = 0.001,
+) -> nn.Module:
+    """A few epochs of centralised fine-tuning to recover any accuracy lost to pruning."""
+    model.train()
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    criterion = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        for loader in train_loaders:
+            for data, target in loader:
+                optimizer.zero_grad()
+                loss = criterion(model(data), target)
+                loss.backward()
+                optimizer.step()
+    return model
+
+
+def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
+    """
+    Reports parameter count, non-zero parameter count (post-pruning), and
+    an approximate CPU inference latency per sample — a proxy for
+    Raspberry-Pi-class edge feasibility (no GPU available on such hardware).
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    nonzero_params = sum((p != 0).sum().item() for p in model.parameters())
+
+    model.eval()
+    dummy = torch.randn(1, input_size)
+    with torch.no_grad():
+        for _ in range(10):          # warm-up
+            model(dummy)
+        import time
+        start = time.perf_counter()
+        for _ in range(200):
+            model(dummy)
+        elapsed_ms = (time.perf_counter() - start) / 200 * 1000
+
+    print(f"  [{label}] Params: {total_params:,}  |  Non-zero: {nonzero_params:,} "
+          f"({100 * nonzero_params / total_params:.1f}%)  |  Avg CPU latency: {elapsed_ms:.3f} ms/sample")
+    return {"total_params": total_params, "nonzero_params": nonzero_params, "latency_ms": elapsed_ms}
+
 
 # =============================================================================
 # 9. PLOTTING CONVERGENCE
@@ -662,17 +847,22 @@ def main():
     # ------------------------------------------------------------------
     use_real_data = DATASET_ROOT.exists()
 
+    # k_best_features implements the "Lightweight Model Design" feature-selection
+    # goal: 115 raw N-BaIoT features -> a smaller chi-squared-selected subset.
+    K_BEST_FEATURES = 40
+
     if use_real_data:
         print("Real N-BaIoT dataset found — loading...")
-        train_loaders, test_loaders, scaler = load_nbaiot_federated(
+        train_loaders, test_loaders, scaler, selected_idx = load_nbaiot_federated(
             dataset_root=DATASET_ROOT,
             max_samples_per_device=5000,
+            k_best_features=K_BEST_FEATURES,
         )
         # Build device name list matching the loaded order
         device_names = [
             d for d in DEVICE_FOLDERS if (DATASET_ROOT / d).exists()
         ]
-        input_size = 115
+        input_size = len(selected_idx)
     else:
         print("N-BaIoT dataset not found at", DATASET_ROOT)
         print("Running with SYNTHETIC Non-IID data for development.\n")
@@ -690,6 +880,19 @@ def main():
 
     # ------------------------------------------------------------------
     # Shared hyperparameters
+    #
+    # client_fraction / conditional_update_delta / quantize_updates
+    # implement the "Communication Cost Reduction" goal:
+    #   - client_fraction < 1.0   -> only a sampled subset of clients
+    #                                train + upload each round
+    #                                (the "top 20 of 100 devices" idea —
+    #                                 with 9 real devices this samples a
+    #                                 subset of 9; see note below if you
+    #                                 want a literal 100-client simulation)
+    #   - conditional_update_delta -> a client's update is dropped if its
+    #                                local loss didn't improve enough
+    #   - quantize_updates         -> simulates fp16 compression on the
+    #                                uplink before server aggregation
     # ------------------------------------------------------------------
     CONFIG = dict(
         input_size   = input_size,
@@ -699,6 +902,9 @@ def main():
         local_epochs = 2,
         lr           = 0.001,
         weight_decay = 1e-4,
+        client_fraction = 0.7,
+        conditional_update_delta = 1e-3,
+        quantize_updates = True,
     )
 
     # ------------------------------------------------------------------
@@ -760,11 +966,32 @@ def main():
                                  target_names=["Benign", "Malicious"]))
 
     # ------------------------------------------------------------------
+    # Lightweight Model Design — prune the best (FedProx) model and
+    # benchmark it against the unpruned version, per the slide's
+    # "run inference on Raspberry Pi-class hardware" target.
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  MODEL PRUNING — Lightweight Model Design")
+    print("="*60)
+    benchmark_model(fedprox_model, input_size, label="FedProx (unpruned)")
+
+    pruned_model = prune_global_model(fedprox_model, amount=0.3)
+    pruned_model = fine_tune(pruned_model, train_loaders, epochs=2, lr=0.001)
+    pruned_model = finalize_pruning(pruned_model)
+    benchmark_model(pruned_model, input_size, label="FedProx (pruned 30%, fine-tuned)")
+
+    print("\n--- Pruned FedProx — Classification Report (all test data) ---")
+    r = evaluate_global_model(pruned_model, test_loaders, device_names)
+    print(classification_report(r["all_targets"], r["all_predictions"],
+                                 target_names=["Benign", "Malicious"]))
+
+    # ------------------------------------------------------------------
     # Save models
     # ------------------------------------------------------------------
     torch.save(fedavg_model.state_dict(),  "fedavg_model.pt")
     torch.save(fedprox_model.state_dict(), "fedprox_model.pt")
-    print("\nModels saved: fedavg_model.pt  |  fedprox_model.pt")
+    torch.save(pruned_model.state_dict(),  "fedprox_model_pruned.pt")
+    print("\nModels saved: fedavg_model.pt  |  fedprox_model.pt  |  fedprox_model_pruned.pt")
 
 
 if __name__ == "__main__":
