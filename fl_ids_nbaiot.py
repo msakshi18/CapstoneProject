@@ -195,9 +195,17 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
     # survive into both the train and test split, the model "generalizes"
     # by recognising rows it was literally trained on. Dedup here, before
     # any split, so duplicates can't land on both sides.
+    #
+    # Dedup at float32 precision, matching what the model actually sees
+    # downstream (features get cast to float32 for training) — two rows
+    # that differ only past float32's ~7 significant digits are, for the
+    # model's purposes, the same row, even if pandas' float64 view treats
+    # them as distinct.
+    feature_cols = [c for c in combined.columns if c != "label"]
     n_before = len(combined)
-    combined = combined.drop_duplicates()
-    n_dropped = n_before - len(combined)
+    dup_mask = combined[feature_cols].astype(np.float32).duplicated()
+    combined = combined[~dup_mask]
+    n_dropped = int(dup_mask.sum())
     if n_dropped > 0:
         print(f"    Dropped {n_dropped:,} exact-duplicate rows "
               f"({100 * n_dropped / n_before:.1f}% of {device_path.name})")
@@ -225,11 +233,14 @@ def load_flat_device_data(dataset_root: Path, device_id: str) -> pd.DataFrame:
     combined = pd.concat(dfs, ignore_index=True)
     combined = combined.dropna()
 
-    # Same rationale as load_device_data: drop exact-duplicate rows before
-    # any split so they can't leak across train/test.
+    # Same rationale as load_device_data: dedup at float32 precision (what
+    # the model actually sees) before any split, so duplicates can't leak
+    # across train/test.
+    feature_cols = [c for c in combined.columns if c != "label"]
     n_before = len(combined)
-    combined = combined.drop_duplicates()
-    n_dropped = n_before - len(combined)
+    dup_mask = combined[feature_cols].astype(np.float32).duplicated()
+    combined = combined[~dup_mask]
+    n_dropped = int(dup_mask.sum())
     if n_dropped > 0:
         print(f"    Dropped {n_dropped:,} exact-duplicate rows "
               f"({100 * n_dropped / n_before:.1f}% of device {device_id})")
@@ -333,6 +344,20 @@ def load_nbaiot_federated(
     y_train_all = np.concatenate(train_labels)
 
     # ------------------------------------------------------------------
+    # Leakage check on the RAW feature space (before any reduction).
+    # This is the scientifically meaningful check: it asks whether the
+    # original flow records themselves are duplicated/near-identical
+    # across train/test. Checking AFTER chi2 selection would be wrong —
+    # N-BaIoT's 115 features are highly redundant by construction (the
+    # same stats computed over 5 overlapping time windows), so collapsing
+    # to k_best_features can make genuinely distinct rows collide in the
+    # reduced space and look like leakage that isn't really there.
+    # ------------------------------------------------------------------
+    if check_leakage:
+        print("\n[Leakage check — RAW 115-feature space, before feature selection]")
+        check_train_test_leakage(train_features, test_features, client_names)
+
+    # ------------------------------------------------------------------
     # Chi-squared feature selection (115 -> k_best_features)
     # chi2 requires non-negative inputs, so we min-max scale first, select
     # the top-k features on the *global* training pool, then z-score only
@@ -352,8 +377,9 @@ def load_nbaiot_federated(
         test_features  = [X[:, selected_idx] for X in test_features]
         X_train_all = np.vstack(train_features)
 
-    if check_leakage:
-        check_train_test_leakage(train_features, test_features, client_names)
+        if check_leakage:
+            print(f"\n[Leakage check — reduced {len(selected_idx)}-feature space, for comparison only]")
+            check_train_test_leakage(train_features, test_features, client_names)
 
     scaler = StandardScaler()
     scaler.fit(X_train_all)
@@ -1090,14 +1116,14 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Run FedProx  (μ = 0.01 — good starting point for N-BaIoT)
+    # Run FedProx
     # ------------------------------------------------------------------
     fedprox_model, fedprox_acc, fedprox_train_acc = run_federated_learning(
         algorithm="fedprox",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
         device_names=device_names,
-        mu=0.001,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
+        mu=0.001,
         **CONFIG,
     )
 
@@ -1139,9 +1165,7 @@ def main():
                                  target_names=["Benign", "Malicious"]))
 
     # ------------------------------------------------------------------
-    # Lightweight Model Design — prune the best (FedProx) model and
-    # benchmark it against the unpruned version, per the slide's
-    # "run inference on Raspberry Pi-class hardware" target.
+    # Lightweight Model Design
     # ------------------------------------------------------------------
     print("\n" + "="*60)
     print("  MODEL PRUNING — Lightweight Model Design")
