@@ -19,16 +19,17 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset, Subset
+from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.feature_selection import SelectKBest, chi2
 from scipy.spatial import cKDTree
 from pathlib import Path
 
 # DATASET LOADING — N-BaIoT
 DATASET_ROOT = Path("N-BaIoT")
+XIIOTID_CSV_PATH = Path("X-IIoTID dataset2.csv")
 
 # Known device folder names in the N-BaIoT dataset
 DEVICE_FOLDERS = [
@@ -106,6 +107,7 @@ def check_train_test_leakage(
     rng = np.random.RandomState(random_state)
     report = {}
 
+    #name, X_tr, X_te = client_names[0], train_features[0], test_features[0]
     for name, X_tr, X_te in zip(client_names, train_features, test_features):
         if len(X_tr) == 0 or len(X_te) == 0:
             continue
@@ -121,6 +123,8 @@ def check_train_test_leakage(
         else:
             test_sample = X_te
 
+        # KD-tree query is fast even on large train sets, so we can afford to
+        # check every test row for its nearest neighbour in the train set.
         tree = cKDTree(X_tr)
         dists, _ = tree.query(test_sample, k=1)
         near_dupes = int((dists < near_dup_distance).sum())
@@ -256,7 +260,7 @@ def load_nbaiot_federated(
     k_best_features: int | None = 40,
     split_strategy: str = "random",
     check_leakage: bool = True,
-) -> tuple[list[DataLoader], list[DataLoader], StandardScaler, list[int]]:
+) -> tuple[list[DataLoader], list[DataLoader], StandardScaler, list[int], list[str]]:
     """
     Loads N-BaIoT data and partitions it into per-device (Non-IID) FL clients.
 
@@ -379,6 +383,8 @@ def load_nbaiot_federated(
 
         if check_leakage:
             print(f"\n[Leakage check — reduced {len(selected_idx)}-feature space, for comparison only]")
+            print("(Higher numbers here than above are expected and are NOT extra real leakage —")
+            print(" they're coincidental collisions caused by dropping redundant columns.)")
             check_train_test_leakage(train_features, test_features, client_names)
 
     scaler = StandardScaler()
@@ -400,7 +406,7 @@ def load_nbaiot_federated(
 
     print(f"\nTotal clients (devices): {len(train_loaders)}")
     print(f"Feature dimensions    : {X_train_all.shape[1]}")
-    return train_loaders, test_loaders, scaler, selected_idx
+    return train_loaders, test_loaders, scaler, selected_idx, client_names
 
 
 def split_train_validation_loaders(
@@ -448,6 +454,204 @@ def split_train_validation_loaders(
         val_loaders.append(DataLoader(val_subset, batch_size=batch_size, shuffle=False))
 
     return train_sub_loaders, val_loaders
+
+
+# =============================================================================
+# 1c. X-IIOTID DATASET LOADING — device-based non-IID via network host IP
+# =============================================================================
+
+# Columns that are identifiers/metadata rather than traffic statistics —
+# excluded from model features. Protocol/Service/Conn_state are excluded
+# deliberately: since these often correlate with WHICH host generated a
+# row, including them risks leaking the client-partition key itself into
+# the feature set.
+XIIOTID_IDENTIFIER_COLS = [
+    "Date", "Timestamp", "Scr_IP", "Scr_port", "Des_IP", "Des_port",
+    "Protocol", "Service", "Conn_state",
+]
+XIIOTID_LABEL_COLS = ["class1", "class2", "class3"]  # class3 = clean binary Normal/Attack
+
+# Values that show up in the IP columns but are NOT real device hosts:
+# placeholders, loopback, and broadcast addresses.
+_XIIOTID_NOISE_IPS = {"?", "0.0.0.0", "255.255.255.255", "127.0.0.1"}
+
+
+def _get_valid_device_ips(ip_series: pd.Series, min_count: int = 1000) -> list[str]:
+    """
+    Returns IPs that represent real, sufficiently-populated devices —
+    excluding placeholders/loopback/broadcast addresses and IPv6
+    link-local addresses (fe80::...), which are auto-configuration
+    traffic, not application-level device activity.
+    """
+    counts = ip_series.value_counts()
+    return [
+        ip for ip, cnt in counts.items()
+        if cnt >= min_count and ip not in _XIIOTID_NOISE_IPS and not str(ip).startswith("fe80")
+    ]
+
+
+def load_xiiotid_federated(
+    csv_path: Path,
+    partition_key: str = "Scr_IP",     # or "Des_IP" — see note below
+    min_client_rows: int = 1000,
+    max_samples_per_device: int = 5000,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    k_best_features: int | None = 40,
+    split_strategy: str = "random",
+    check_leakage: bool = True,
+) -> tuple[list[DataLoader], list[DataLoader], StandardScaler, list[int], list[str]]:
+    """
+    Loads X-IIoTID and partitions it by network host (Scr_IP or Des_IP),
+    mirroring the per-device client structure used for N-BaIoT. Each
+    distinct, sufficiently-populated IP becomes one federated client —
+    a REAL structural partition (different hosts across the testbed's
+    edge/platform/enterprise tiers), not a synthetic non-IID split.
+
+    partition_key:
+      "Scr_IP" — partitions by the host that INITIATED each flow.
+      "Des_IP" — partitions by the host that RECEIVED each flow (i.e. the
+                 device being targeted). Conceptually closer to "each
+                 device runs its own local IDS on traffic aimed at it" —
+                 worth deciding deliberately rather than defaulting.
+
+    Returns (train_loaders, test_loaders, scaler, selected_feature_idx,
+    client_names) — client_names are the IP addresses used as client IDs.
+    """
+    print(f"Loading X-IIoTID from {csv_path} ...")
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    # The raw CSV uses '?' as a missing-value placeholder in several
+    # columns, which forces those columns to object dtype (this is what
+    # produced the DtypeWarning on load).
+    df = df.replace("?", np.nan)
+
+    # class3 is already a clean binary Normal/Attack label.
+    df["label"] = (df["class3"].astype(str).str.strip().str.lower() == "attack").astype(np.int64)
+
+    drop_cols = set(XIIOTID_IDENTIFIER_COLS) | set(XIIOTID_LABEL_COLS)
+    feature_cols = [c for c in df.columns if c not in drop_cols and c != "label"]
+
+    # Coerce every feature column to numeric; anything that fails (stray
+    # placeholders, stray strings) becomes NaN.
+    for col in feature_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Some feature columns can be NaN for the vast majority (or all) of
+    # rows in the real file — e.g. log-derived features (OSSEC/login/file-
+    # activity fields) that only populate for certain event types. A single
+    # such column would wipe out every row under a blanket dropna(), which
+    # is exactly the bug this replaces: columns above nan_col_threshold are
+    # dropped entirely (unusable as features); the remainder are imputed
+    # with 0 rather than dropping rows, since for count/rate/flag-style
+    # network features, "missing" plausibly means "not recorded" ~ 0 —
+    # not a reason to discard the whole row.
+    nan_col_threshold = 0.5
+    nan_fractions = df[feature_cols].isna().mean()
+    high_nan_cols = nan_fractions[nan_fractions > nan_col_threshold].index.tolist()
+    if high_nan_cols:
+        print(f"\n  Dropping {len(high_nan_cols)} feature column(s) >{nan_col_threshold:.0%} NaN "
+              f"(unusable, not row-level missingness):")
+        for col in high_nan_cols:
+            print(f"    {col:<30} {nan_fractions[col]:.1%} NaN")
+        feature_cols = [c for c in feature_cols if c not in high_nan_cols]
+
+    remaining_nan_pct = df[feature_cols].isna().mean().mean() * 100
+    if remaining_nan_pct > 0:
+        print(f"  Imputing remaining scattered NaNs in kept columns with 0 "
+              f"(avg {remaining_nan_pct:.2f}% of cells across kept features)")
+    df[feature_cols] = df[feature_cols].fillna(0)
+
+    valid_ips = _get_valid_device_ips(df[partition_key], min_count=min_client_rows)
+    print(f"  Partition key: {partition_key}  |  {len(valid_ips)} candidate clients "
+          f"(after excluding loopback/broadcast/IPv6 link-local/low-volume hosts)")
+
+    client_names, train_features, train_labels, test_features, test_labels = [], [], [], [], []
+
+    for ip in valid_ips:
+        client_df = df.loc[df[partition_key] == ip, feature_cols + ["label"]]
+
+        if len(client_df) < min_client_rows:
+            print(f"    Skipping {ip}: only {len(client_df)} clean rows after NaN removal")
+            continue
+
+        # A client with only one class can't do meaningful local binary
+        # training — this is the check that matters most before committing
+        # to a partition key.
+        class_counts = client_df["label"].value_counts()
+        if len(class_counts) < 2:
+            print(f"    Skipping {ip}: single-class only ({class_counts.to_dict()}) — cannot train binary IDS locally")
+            continue
+
+        if len(client_df) > max_samples_per_device:
+            client_df = client_df.sample(n=max_samples_per_device, random_state=random_state)
+
+        n_before = len(client_df)
+        client_df = client_df.drop_duplicates()
+        n_dropped = n_before - len(client_df)
+        if n_dropped > 0:
+            print(f"    Dropped {n_dropped:,} exact-duplicate rows "
+                  f"({100 * n_dropped / n_before:.1f}%) for {ip}")
+
+        X_dev = client_df[feature_cols].values.astype(np.float32)
+        y_dev = client_df["label"].values.astype(np.int64)
+        X_tr, X_te, y_tr, y_te = _split_device(X_dev, y_dev, test_size, random_state, split_strategy)
+
+        client_names.append(ip)
+        train_features.append(X_tr)
+        test_features.append(X_te)
+        train_labels.append(y_tr)
+        test_labels.append(y_te)
+
+    if not client_names:
+        raise ValueError(
+            "No usable clients found — check partition_key, min_client_rows, "
+            "and that the label column mapping is correct."
+        )
+
+    print(f"\n  Final usable clients: {len(client_names)}")
+    for name, X_tr in zip(client_names, train_features):
+        print(f"    {name:<20} train rows: {len(X_tr)}")
+
+    X_train_all = np.vstack(train_features)
+    y_train_all = np.concatenate(train_labels)
+
+    if check_leakage:
+        print("\n[Leakage check — RAW feature space, before feature selection]")
+        check_train_test_leakage(train_features, test_features, client_names)
+
+    selected_idx = list(range(X_train_all.shape[1]))
+    if k_best_features is not None and k_best_features < X_train_all.shape[1]:
+        minmax = MinMaxScaler()
+        X_train_nonneg = minmax.fit_transform(X_train_all)
+        selector = SelectKBest(score_func=chi2, k=k_best_features)
+        selector.fit(X_train_nonneg, y_train_all)
+        selected_idx = np.where(selector.get_support())[0].tolist()
+        print(f"\nChi-squared feature selection: {X_train_all.shape[1]} -> {len(selected_idx)} features")
+
+        train_features = [X[:, selected_idx] for X in train_features]
+        test_features  = [X[:, selected_idx] for X in test_features]
+        X_train_all = np.vstack(train_features)
+
+        if check_leakage:
+            print(f"\n[Leakage check — reduced {len(selected_idx)}-feature space, for comparison only]")
+            check_train_test_leakage(train_features, test_features, client_names)
+
+    scaler = StandardScaler()
+    scaler.fit(X_train_all)
+
+    train_loaders, test_loaders = [], []
+    for X_tr, y_tr, X_te, y_te in zip(train_features, train_labels, test_features, test_labels):
+        X_tr = scaler.transform(X_tr)
+        X_te = scaler.transform(X_te)
+        train_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
+        test_ds  = TensorDataset(torch.tensor(X_te),  torch.tensor(y_te))
+        train_loaders.append(DataLoader(train_ds, batch_size=64, shuffle=True))
+        test_loaders.append(DataLoader(test_ds,  batch_size=64, shuffle=False))
+
+    print(f"\nTotal clients (devices): {len(train_loaders)}")
+    print(f"Feature dimensions    : {X_train_all.shape[1]}")
+    return train_loaders, test_loaders, scaler, selected_idx, client_names
 
 
 # =============================================================================
@@ -534,6 +738,32 @@ class SimpleMLP(nn.Module):
 
 
 # =============================================================================
+# 3b. CLASS-WEIGHT HELPER — for severe per-client label skew
+# =============================================================================
+
+def compute_class_weights(loader: DataLoader, num_classes: int = 2) -> torch.Tensor:
+    """
+    Computes inverse-frequency class weights from a single client's own
+    local training labels (not the global dataset). Used to counteract
+    severe per-client label skew — e.g. a client whose local data is 99%
+    one class, where an unweighted loss lets gradients from the majority
+    class dominate and the model never learns the minority class on that
+    client, even for data it directly trained on.
+
+    Weight formula: w_c = N / (num_classes * count_c), i.e. rarer classes
+    get proportionally larger weight. Falls back to uniform weights (all
+    1.0) if a class is entirely absent from this client's local data,
+    since a weight can't meaningfully compensate for zero examples.
+    """
+    all_targets = torch.cat([target for _, target in loader])
+    counts = torch.bincount(all_targets, minlength=num_classes).float()
+    if (counts == 0).any():
+        return torch.ones(num_classes)
+    weights = len(all_targets) / (num_classes * counts)
+    return weights
+
+
+# =============================================================================
 # 4. CLIENT TRAINING — FedAvg
 # =============================================================================
 
@@ -542,10 +772,21 @@ def client_update_fedavg(
     optimizer: optim.Optimizer,
     train_loader: DataLoader,
     epochs: int = 2,
+    class_weights: torch.Tensor | None = None,
 ) -> dict:
-    """Standard local training for FedAvg — no proximal term."""
+    """
+    Standard local training for FedAvg — no proximal term.
+
+    class_weights (optional): per-class weights passed to CrossEntropyLoss,
+    computed from THIS client's own local label distribution. Critical
+    under severe per-client label skew (e.g. a client that's 99% one
+    class) — without this, the loss gradient is dominated by the majority
+    class and the model learns almost nothing about the minority class on
+    that client, which then drags down that client's own precision/recall
+    even on data it trained on.
+    """
     client_model.train()
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     initial_loss, final_loss = None, None
 
     for epoch in range(epochs):
@@ -576,6 +817,7 @@ def client_update_fedprox(
     train_loader: DataLoader,
     epochs: int = 2,
     mu: float = 0.01,
+    class_weights: torch.Tensor | None = None,
 ) -> dict:
     """
     FedProx local training with proximal regularisation term.
@@ -591,12 +833,19 @@ def client_update_fedprox(
       - Without the term, local models overfit their own distribution
       - With μ > 0, updates stay anchored near the global optimum
 
+    class_weights (optional): per-class weights computed from this
+    client's own local label distribution, passed to CrossEntropyLoss.
+    Note this addresses a DIFFERENT problem than μ: μ corrects for
+    parameter/feature drift between clients; class_weights corrects for
+    label-distribution skew WITHIN a client's own local training. Both
+    can be needed at once under severe non-IID label skew.
+
     Args:
         mu: proximal coefficient (0 = pure FedAvg; higher = tighter anchor)
             Typical range: 0.001 – 0.1. Start with 0.01 for N-BaIoT.
     """
     client_model.train()
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # Freeze a snapshot of the global weights (used in proximal term)
     global_params = {
@@ -721,8 +970,14 @@ def evaluate_global_model(
                 print(f"    {name:<45} Acc: {acc:.4f}")
 
     overall_acc = sum(p == t for p, t in zip(all_preds, all_targets)) / len(all_targets)
+    # Macro-F1 treats both classes equally regardless of how imbalanced
+    # they are — unlike accuracy, a model that just predicts the majority
+    # class on a 99%-skewed client scores poorly here, not well. This is
+    # used for model-selection/early-stopping instead of raw accuracy.
+    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
     return {
         "overall_accuracy": overall_acc,
+        "macro_f1": macro_f1,
         "per_client_accuracy": per_client_acc,
         "all_predictions": all_preds,
         "all_targets": all_targets,
@@ -752,15 +1007,19 @@ def run_federated_learning(
     client_fraction: float = 1.0,      # Client selection: fraction of clients sampled per round
     conditional_update_delta: float = 0.0,  # Skip an update if local loss doesn't improve by at least this much
     quantize_updates: bool = False,    # Simulate uplink compression (float32 -> float16)
+    use_class_weights: bool = True,    # Per-client inverse-frequency class weighting — critical under label skew
     random_state: int = 42,
-) -> tuple[nn.Module, list[float], list[float]]:
+) -> tuple[nn.Module, list[float], list[float], dict]:
     """
     Main federated learning loop.
 
     FedAvg:   standard averaging — all clients train freely
     FedProx:  adds proximal term μ/2 ||w - w_global||² to each client's loss
 
-    Returns the trained global model and round-by-round accuracy history.
+    Returns the trained global model, round-by-round test accuracy history,
+    round-by-round train accuracy history, and a stats dict with cumulative
+    communication cost and convergence-round info (used by the ablation
+    table / ADR-style comparison across configs).
     """
     assert algorithm in ("fedavg", "fedprox"), "algorithm must be 'fedavg' or 'fedprox'"
     num_clients = len(train_loaders)
@@ -783,9 +1042,12 @@ def run_federated_learning(
     global_model = SimpleMLP(input_size, hidden_size, num_classes)
     accuracy_history = []
     train_accuracy_history = []
-    best_val_accuracy = float("-inf")
+    best_val_metric = float("-inf")
     best_model_state = copy.deepcopy(global_model.state_dict())
     stale_rounds = 0
+    best_round = 0                    # 1-indexed round that produced best_model_state — proxy for "rounds to converge"
+    total_bytes_before = 0            # cumulative uncompressed uplink payload across the whole run
+    total_bytes_after = 0             # cumulative payload actually "sent" (post-compression if enabled)
 
     for round_idx in range(num_rounds):
         # ------------------------------------------------------------
@@ -812,14 +1074,17 @@ def run_federated_learning(
                 weight_decay=weight_decay,
             )
 
+            class_weights = compute_class_weights(train_loaders[i], num_classes) if use_class_weights else None
+
             if algorithm == "fedavg":
                 weights, loss_before, loss_after = client_update_fedavg(
-                    client_model, optimizer, train_loaders[i], epochs=local_epochs
+                    client_model, optimizer, train_loaders[i], epochs=local_epochs,
+                    class_weights=class_weights,
                 )
             else:  # fedprox
                 weights, loss_before, loss_after = client_update_fedprox(
                     client_model, global_model, optimizer, train_loaders[i],
-                    epochs=local_epochs, mu=mu
+                    epochs=local_epochs, mu=mu, class_weights=class_weights,
                 )
 
             # ------------------------------------------------------------
@@ -852,6 +1117,8 @@ def run_federated_learning(
         if quantize_updates and bytes_before:
             print(f"  Update compression : {bytes_before/1024:.1f} KB -> {bytes_after/1024:.1f} KB "
                   f"({100 * (1 - bytes_after / bytes_before):.0f}% smaller)")
+        total_bytes_before += bytes_before
+        total_bytes_after += bytes_after
 
         if not client_weights:
             print("  No client updates this round — keeping previous global model.")
@@ -863,10 +1130,17 @@ def run_federated_learning(
         print(f"\nRound {round_idx + 1}/{num_rounds} — Validation accuracy:")
         val_results = evaluate_global_model(global_model, val_loaders, device_names)
         val_accuracy = val_results["overall_accuracy"]
+        val_macro_f1 = val_results["macro_f1"]
+        print(f"  Validation macro-F1: {val_macro_f1:.4f}  (accuracy: {val_accuracy:.4f})")
 
-        if val_accuracy > best_val_accuracy + min_delta:
-            best_val_accuracy = val_accuracy
+        # Model selection uses macro-F1, not raw accuracy — under severe
+        # per-client label skew, a model that just predicts the majority
+        # class scores deceptively high accuracy while doing nothing
+        # useful; macro-F1 penalises that.
+        if val_macro_f1 > best_val_metric + min_delta:
+            best_val_metric = val_macro_f1
             best_model_state = copy.deepcopy(global_model.state_dict())
+            best_round = round_idx + 1
             stale_rounds = 0
         else:
             stale_rounds += 1
@@ -895,7 +1169,14 @@ def run_federated_learning(
 
     global_model.load_state_dict(best_model_state)
 
-    return global_model, accuracy_history, train_accuracy_history
+    stats = {
+        "rounds_run": round_idx + 1,
+        "best_round": best_round,          # rounds-to-converge proxy
+        "total_bytes_before": total_bytes_before,
+        "total_bytes_after": total_bytes_after,
+        "final_test_accuracy": accuracy_history[-1] if accuracy_history else None,
+    }
+    return global_model, accuracy_history, train_accuracy_history, stats
 
 # =============================================================================
 # 8b. MODEL PRUNING & EDGE-DEVICE BENCHMARK (Lightweight Model Design)
@@ -976,6 +1257,177 @@ def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
 
 
 # =============================================================================
+# 8c. ABLATION STUDY — one table covering all four research gaps
+# =============================================================================
+
+def run_ablation_study(
+    train_loaders: list[DataLoader],
+    test_loaders: list[DataLoader],
+    device_names: list[str],
+    input_size: int,
+    hidden_size: int = 32,
+    num_classes: int = 2,
+    num_rounds: int = 8,
+    local_epochs: int = 2,
+    lr: float = 0.001,
+    weight_decay: float = 1e-4,
+    mu: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Runs FedProx under four configurations and reports one comparison table:
+
+      1. Baseline           — no client selection, no conditional updates,
+                              no compression, no pruning
+      2. + Comm. reduction  — client_fraction=0.7, conditional updates,
+                              fp16 update compression (research gap #1)
+      3. + Pruning          — baseline + post-hoc magnitude pruning,
+                              fine-tuned (research gap #2)
+      4. All combined       — comm. reduction + pruning together
+                              (the number to actually report as your
+                              headline "lightweight + low-communication" result)
+
+    Reports, per config: final test accuracy, rounds-to-converge (the round
+    that produced the best validation model), total KB "sent" over the
+    whole run, total/non-zero parameter count, and CPU inference latency —
+    i.e. one row per research gap, directly comparable.
+    """
+    configs = {
+        "1. Baseline":          dict(client_fraction=1.0, conditional_update_delta=0.0, quantize_updates=False, prune=False),
+        "2. + Comm. reduction": dict(client_fraction=0.7, conditional_update_delta=1e-3, quantize_updates=True,  prune=False),
+        "3. + Pruning":         dict(client_fraction=1.0, conditional_update_delta=0.0, quantize_updates=False, prune=True),
+        "4. All combined":      dict(client_fraction=0.7, conditional_update_delta=1e-3, quantize_updates=True,  prune=True),
+    }
+
+    rows = []
+    for name, cfg in configs.items():
+        print(f"\n{'#'*60}\n  ABLATION CONFIG: {name}\n{'#'*60}")
+        model, acc_hist, train_hist, stats = run_federated_learning(
+            algorithm="fedprox",
+            train_loaders=train_loaders,
+            test_loaders=test_loaders,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_classes=num_classes,
+            num_rounds=num_rounds,
+            local_epochs=local_epochs,
+            lr=lr,
+            weight_decay=weight_decay,
+            mu=mu,
+            device_names=device_names,
+            client_fraction=cfg["client_fraction"],
+            conditional_update_delta=cfg["conditional_update_delta"],
+            quantize_updates=cfg["quantize_updates"],
+        )
+
+        final_acc = stats["final_test_accuracy"]
+        if cfg["prune"]:
+            model = prune_global_model(model, amount=0.3)
+            model = fine_tune(model, train_loaders, epochs=2, lr=0.001)
+            model = finalize_pruning(model)
+            eval_result = evaluate_global_model(model, test_loaders, device_names, verbose=False)
+            final_acc = eval_result["overall_accuracy"]
+
+        bench = benchmark_model(model, input_size, label=name)
+        kb_sent = stats["total_bytes_after"] / 1024 if stats["total_bytes_after"] else 0.0
+
+        rows.append({
+            "Config": name,
+            "Final Accuracy": round(final_acc, 4),
+            "Rounds to Converge": stats["best_round"],
+            "Total KB Sent": round(kb_sent, 1),
+            "Total Params": bench["total_params"],
+            "Non-zero Params": bench["nonzero_params"],
+            "Latency (ms/sample)": round(bench["latency_ms"], 4),
+        })
+
+    df = pd.DataFrame(rows)
+    print(f"\n{'='*60}\n  ABLATION SUMMARY TABLE\n{'='*60}")
+    print(df.to_string(index=False))
+    return df
+
+
+# =============================================================================
+# 8d. LEAVE-ONE-DEVICE-OUT GENERALIZATION TEST (Non-IID gap, cross-device)
+# =============================================================================
+
+def leave_one_device_out_eval(
+    train_loaders: list[DataLoader],
+    test_loaders: list[DataLoader],
+    device_names: list[str],
+    input_size: int,
+    hidden_size: int = 32,
+    num_classes: int = 2,
+    algorithm: str = "fedprox",
+    num_rounds: int = 8,
+    local_epochs: int = 2,
+    lr: float = 0.001,
+    weight_decay: float = 1e-4,
+    mu: float = 0.01,
+) -> dict:
+    """
+    Leave-one-device-out (LODO) generalization test.
+
+    For each device, trains a federated model using ONLY the other 8
+    devices as clients, then evaluates on the held-out device's FULL data
+    (its train + test loaders combined — none of it was used in training
+    at all). This is a much stronger check than an in-device random split:
+    it asks whether the model generalizes to a device it has never seen,
+    which is the real claim behind "FedProx handles non-IID heterogeneity"
+    — a within-device train/test split can't tell you that on its own.
+
+    Returns {device_name: held_out_accuracy}.
+    """
+    results = {}
+    num_devices = len(train_loaders)
+
+    for held_out_idx in range(num_devices):
+        held_out_name = device_names[held_out_idx]
+        other_train_loaders = [train_loaders[i] for i in range(num_devices) if i != held_out_idx]
+        other_test_loaders  = [test_loaders[i]  for i in range(num_devices) if i != held_out_idx]
+        other_names = [d for i, d in enumerate(device_names) if i != held_out_idx]
+
+        print(f"\n{'='*60}")
+        print(f"  LEAVE-ONE-DEVICE-OUT: holding out {held_out_name} ({held_out_idx + 1}/{num_devices})")
+        print(f"{'='*60}")
+
+        model, _, _, _ = run_federated_learning(
+            algorithm=algorithm,
+            train_loaders=other_train_loaders,
+            test_loaders=other_test_loaders,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_classes=num_classes,
+            num_rounds=num_rounds,
+            local_epochs=local_epochs,
+            lr=lr,
+            weight_decay=weight_decay,
+            mu=mu,
+            device_names=other_names,
+        )
+
+        # Evaluate on the held-out device's FULL data — genuinely unseen.
+        held_out_full = ConcatDataset([train_loaders[held_out_idx].dataset, test_loaders[held_out_idx].dataset])
+        held_out_loader = DataLoader(held_out_full, batch_size=64, shuffle=False)
+
+        eval_result = evaluate_global_model(model, [held_out_loader], [held_out_name], verbose=False)
+        acc = eval_result["overall_accuracy"]
+        results[held_out_name] = acc
+        print(f"  >> {held_out_name} held-out accuracy (never seen in training): {acc:.4f}")
+
+    print(f"\n{'='*60}")
+    print("  LEAVE-ONE-DEVICE-OUT SUMMARY")
+    print(f"{'='*60}")
+    for name, acc in results.items():
+        print(f"    {name:<45} {acc:.4f}")
+    avg_acc = sum(results.values()) / len(results)
+    print(f"\n  Average held-out accuracy: {avg_acc:.4f}")
+    print("  (Compare this to your in-device test accuracy. If it's close, the model")
+    print("   genuinely generalizes across devices. If it's much lower, the model is")
+    print("   fitting per-device quirks rather than transferable attack signatures.)")
+    return results
+
+
+# =============================================================================
 # 9. PLOTTING CONVERGENCE
 # =============================================================================
 
@@ -1033,10 +1485,15 @@ def main():
     # ------------------------------------------------------------------
     # Dataset loading
     # ------------------------------------------------------------------
-    use_real_data = DATASET_ROOT.exists()
+    # ------------------------------------------------------------------
+    # Dataset loading — X-IIoTID (primary), falling back to N-BaIoT, then
+    # synthetic data for development if neither is present.
+    # ------------------------------------------------------------------
+    use_xiiotid  = XIIOTID_CSV_PATH.exists()
+    use_nbaiot   = (not use_xiiotid) and DATASET_ROOT.exists()
 
     # k_best_features implements the "Lightweight Model Design" feature-selection
-    # goal: 115 raw N-BaIoT features -> a smaller chi-squared-selected subset.
+    # goal: shrinking the raw feature set to a smaller chi-squared-selected subset.
     K_BEST_FEATURES = 40
 
     # SPLIT_STRATEGY controls the leakage investigation:
@@ -1046,27 +1503,39 @@ def main():
     #              below reports meaningful near-duplicate rates under "random"
     SPLIT_STRATEGY = "random"
 
-    if use_real_data:
+    # Which network host becomes the partition key for X-IIoTID:
+    #   "Scr_IP" — partitions by the host that INITIATED each flow
+    #   "Des_IP" — partitions by the host that RECEIVED each flow (the
+    #              device being targeted) — conceptually closer to "each
+    #              device runs its own local IDS", worth testing both.
+    XIIOTID_PARTITION_KEY = "Scr_IP"
+
+    if use_xiiotid:
+        print("X-IIoTID dataset found — loading...")
+        train_loaders, test_loaders, scaler, selected_idx, device_names = load_xiiotid_federated(
+            csv_path=XIIOTID_CSV_PATH,
+            partition_key=XIIOTID_PARTITION_KEY,
+            max_samples_per_device=5000,
+            k_best_features=K_BEST_FEATURES,
+            split_strategy=SPLIT_STRATEGY,
+            check_leakage=True,
+        )
+        input_size = len(selected_idx)
+    elif use_nbaiot:
         print("Real N-BaIoT dataset found — loading...")
-        train_loaders, test_loaders, scaler, selected_idx = load_nbaiot_federated(
+        train_loaders, test_loaders, scaler, selected_idx, device_names = load_nbaiot_federated(
             dataset_root=DATASET_ROOT,
             max_samples_per_device=5000,
             k_best_features=K_BEST_FEATURES,
             split_strategy=SPLIT_STRATEGY,
             check_leakage=True,
         )
-        # Build device name list matching the loaded order
-        device_names = [
-            d for d in DEVICE_FOLDERS if (DATASET_ROOT / d).exists()
-        ]
         input_size = len(selected_idx)
     else:
-        print("N-BaIoT dataset not found at", DATASET_ROOT)
+        print("Neither X-IIoTID nor N-BaIoT dataset found.")
         print("Running with SYNTHETIC Non-IID data for development.\n")
-        print("To use real data:")
-        print("  1. Download from https://archive.ics.uci.edu/ml/datasets/")
-        print("     detection_of_IoT_botnet_attacks_N_BaIoT")
-        print(f"  2. Set DATASET_ROOT = Path('<your_path>') at top of this file\n")
+        print(f"  To use X-IIoTID: place the CSV at '{XIIOTID_CSV_PATH}'")
+        print(f"  To use N-BaIoT: set DATASET_ROOT at the top of this file\n")
         train_loaders, test_loaders = make_synthetic_noniid_loaders(
             num_clients=9, input_size=115, samples_per_client=1000
         )
@@ -1107,7 +1576,7 @@ def main():
     # ------------------------------------------------------------------
     # Run FedAvg baseline
     # ------------------------------------------------------------------
-    fedavg_model, fedavg_acc, fedavg_train_acc = run_federated_learning(
+    fedavg_model, fedavg_acc, fedavg_train_acc, fedavg_stats = run_federated_learning(
         algorithm="fedavg",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
@@ -1116,14 +1585,14 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Run FedProx
+    # Run FedProx  (μ = 0.01 — good starting point for N-BaIoT)
     # ------------------------------------------------------------------
-    fedprox_model, fedprox_acc, fedprox_train_acc = run_federated_learning(
+    fedprox_model, fedprox_acc, fedprox_train_acc, fedprox_stats = run_federated_learning(
         algorithm="fedprox",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
         device_names=device_names,
-        mu=0.001,
+        mu=0.001,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
         **CONFIG,
     )
 
@@ -1165,7 +1634,9 @@ def main():
                                  target_names=["Benign", "Malicious"]))
 
     # ------------------------------------------------------------------
-    # Lightweight Model Design
+    # Lightweight Model Design — prune the best (FedProx) model and
+    # benchmark it against the unpruned version, per the slide's
+    # "run inference on Raspberry Pi-class hardware" target.
     # ------------------------------------------------------------------
     print("\n" + "="*60)
     print("  MODEL PRUNING — Lightweight Model Design")
@@ -1189,6 +1660,40 @@ def main():
     torch.save(fedprox_model.state_dict(), "fedprox_model.pt")
     torch.save(pruned_model.state_dict(),  "fedprox_model_pruned.pt")
     print("\nModels saved: fedavg_model.pt  |  fedprox_model.pt  |  fedprox_model_pruned.pt")
+
+    # ------------------------------------------------------------------
+    # Ablation table — one row per research gap (comm. reduction,
+    # lightweight design, both combined), directly comparable numbers
+    # for the dissertation results section.
+    # ------------------------------------------------------------------
+    ablation_df = run_ablation_study(
+        train_loaders, test_loaders, device_names, input_size,
+        hidden_size=CONFIG["hidden_size"],
+        num_rounds=CONFIG["num_rounds"],
+        local_epochs=CONFIG["local_epochs"],
+        lr=CONFIG["lr"],
+        weight_decay=CONFIG["weight_decay"],
+    )
+    ablation_df.to_csv("ablation_results.csv", index=False)
+    print("\nAblation table saved to: ablation_results.csv")
+
+    # ------------------------------------------------------------------
+    # Leave-one-device-out generalization test — the real evidence for
+    # the "FedProx handles non-IID heterogeneity" claim: does the model
+    # transfer to a device it has never trained on at all?
+    # ------------------------------------------------------------------
+    lodo_results = leave_one_device_out_eval(
+        train_loaders, test_loaders, device_names, input_size,
+        hidden_size=CONFIG["hidden_size"],
+        num_rounds=CONFIG["num_rounds"],
+        local_epochs=CONFIG["local_epochs"],
+        lr=CONFIG["lr"],
+        weight_decay=CONFIG["weight_decay"],
+    )
+    pd.DataFrame(
+        [{"device": k, "held_out_accuracy": v} for k, v in lodo_results.items()]
+    ).to_csv("leave_one_device_out_results.csv", index=False)
+    print("\nLODO results saved to: leave_one_device_out_results.csv")
 
 
 if __name__ == "__main__":
