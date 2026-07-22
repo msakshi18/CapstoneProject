@@ -22,14 +22,13 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, matthews_corrcoef
 from sklearn.feature_selection import SelectKBest, chi2
 from scipy.spatial import cKDTree
 from pathlib import Path
 
 # DATASET LOADING — N-BaIoT
 DATASET_ROOT = Path("N-BaIoT")
-XIIOTID_CSV_PATH = Path("X-IIoTID dataset2.csv")
 
 # Known device folder names in the N-BaIoT dataset
 DEVICE_FOLDERS = [
@@ -457,204 +456,6 @@ def split_train_validation_loaders(
 
 
 # =============================================================================
-# 1c. X-IIOTID DATASET LOADING — device-based non-IID via network host IP
-# =============================================================================
-
-# Columns that are identifiers/metadata rather than traffic statistics —
-# excluded from model features. Protocol/Service/Conn_state are excluded
-# deliberately: since these often correlate with WHICH host generated a
-# row, including them risks leaking the client-partition key itself into
-# the feature set.
-XIIOTID_IDENTIFIER_COLS = [
-    "Date", "Timestamp", "Scr_IP", "Scr_port", "Des_IP", "Des_port",
-    "Protocol", "Service", "Conn_state",
-]
-XIIOTID_LABEL_COLS = ["class1", "class2", "class3"]  # class3 = clean binary Normal/Attack
-
-# Values that show up in the IP columns but are NOT real device hosts:
-# placeholders, loopback, and broadcast addresses.
-_XIIOTID_NOISE_IPS = {"?", "0.0.0.0", "255.255.255.255", "127.0.0.1"}
-
-
-def _get_valid_device_ips(ip_series: pd.Series, min_count: int = 1000) -> list[str]:
-    """
-    Returns IPs that represent real, sufficiently-populated devices —
-    excluding placeholders/loopback/broadcast addresses and IPv6
-    link-local addresses (fe80::...), which are auto-configuration
-    traffic, not application-level device activity.
-    """
-    counts = ip_series.value_counts()
-    return [
-        ip for ip, cnt in counts.items()
-        if cnt >= min_count and ip not in _XIIOTID_NOISE_IPS and not str(ip).startswith("fe80")
-    ]
-
-
-def load_xiiotid_federated(
-    csv_path: Path,
-    partition_key: str = "Scr_IP",     # or "Des_IP" — see note below
-    min_client_rows: int = 1000,
-    max_samples_per_device: int = 5000,
-    test_size: float = 0.2,
-    random_state: int = 42,
-    k_best_features: int | None = 40,
-    split_strategy: str = "random",
-    check_leakage: bool = True,
-) -> tuple[list[DataLoader], list[DataLoader], StandardScaler, list[int], list[str]]:
-    """
-    Loads X-IIoTID and partitions it by network host (Scr_IP or Des_IP),
-    mirroring the per-device client structure used for N-BaIoT. Each
-    distinct, sufficiently-populated IP becomes one federated client —
-    a REAL structural partition (different hosts across the testbed's
-    edge/platform/enterprise tiers), not a synthetic non-IID split.
-
-    partition_key:
-      "Scr_IP" — partitions by the host that INITIATED each flow.
-      "Des_IP" — partitions by the host that RECEIVED each flow (i.e. the
-                 device being targeted). Conceptually closer to "each
-                 device runs its own local IDS on traffic aimed at it" —
-                 worth deciding deliberately rather than defaulting.
-
-    Returns (train_loaders, test_loaders, scaler, selected_feature_idx,
-    client_names) — client_names are the IP addresses used as client IDs.
-    """
-    print(f"Loading X-IIoTID from {csv_path} ...")
-    df = pd.read_csv(csv_path, low_memory=False)
-
-    # The raw CSV uses '?' as a missing-value placeholder in several
-    # columns, which forces those columns to object dtype (this is what
-    # produced the DtypeWarning on load).
-    df = df.replace("?", np.nan)
-
-    # class3 is already a clean binary Normal/Attack label.
-    df["label"] = (df["class3"].astype(str).str.strip().str.lower() == "attack").astype(np.int64)
-
-    drop_cols = set(XIIOTID_IDENTIFIER_COLS) | set(XIIOTID_LABEL_COLS)
-    feature_cols = [c for c in df.columns if c not in drop_cols and c != "label"]
-
-    # Coerce every feature column to numeric; anything that fails (stray
-    # placeholders, stray strings) becomes NaN.
-    for col in feature_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Some feature columns can be NaN for the vast majority (or all) of
-    # rows in the real file — e.g. log-derived features (OSSEC/login/file-
-    # activity fields) that only populate for certain event types. A single
-    # such column would wipe out every row under a blanket dropna(), which
-    # is exactly the bug this replaces: columns above nan_col_threshold are
-    # dropped entirely (unusable as features); the remainder are imputed
-    # with 0 rather than dropping rows, since for count/rate/flag-style
-    # network features, "missing" plausibly means "not recorded" ~ 0 —
-    # not a reason to discard the whole row.
-    nan_col_threshold = 0.5
-    nan_fractions = df[feature_cols].isna().mean()
-    high_nan_cols = nan_fractions[nan_fractions > nan_col_threshold].index.tolist()
-    if high_nan_cols:
-        print(f"\n  Dropping {len(high_nan_cols)} feature column(s) >{nan_col_threshold:.0%} NaN "
-              f"(unusable, not row-level missingness):")
-        for col in high_nan_cols:
-            print(f"    {col:<30} {nan_fractions[col]:.1%} NaN")
-        feature_cols = [c for c in feature_cols if c not in high_nan_cols]
-
-    remaining_nan_pct = df[feature_cols].isna().mean().mean() * 100
-    if remaining_nan_pct > 0:
-        print(f"  Imputing remaining scattered NaNs in kept columns with 0 "
-              f"(avg {remaining_nan_pct:.2f}% of cells across kept features)")
-    df[feature_cols] = df[feature_cols].fillna(0)
-
-    valid_ips = _get_valid_device_ips(df[partition_key], min_count=min_client_rows)
-    print(f"  Partition key: {partition_key}  |  {len(valid_ips)} candidate clients "
-          f"(after excluding loopback/broadcast/IPv6 link-local/low-volume hosts)")
-
-    client_names, train_features, train_labels, test_features, test_labels = [], [], [], [], []
-
-    for ip in valid_ips:
-        client_df = df.loc[df[partition_key] == ip, feature_cols + ["label"]]
-
-        if len(client_df) < min_client_rows:
-            print(f"    Skipping {ip}: only {len(client_df)} clean rows after NaN removal")
-            continue
-
-        # A client with only one class can't do meaningful local binary
-        # training — this is the check that matters most before committing
-        # to a partition key.
-        class_counts = client_df["label"].value_counts()
-        if len(class_counts) < 2:
-            print(f"    Skipping {ip}: single-class only ({class_counts.to_dict()}) — cannot train binary IDS locally")
-            continue
-
-        if len(client_df) > max_samples_per_device:
-            client_df = client_df.sample(n=max_samples_per_device, random_state=random_state)
-
-        n_before = len(client_df)
-        client_df = client_df.drop_duplicates()
-        n_dropped = n_before - len(client_df)
-        if n_dropped > 0:
-            print(f"    Dropped {n_dropped:,} exact-duplicate rows "
-                  f"({100 * n_dropped / n_before:.1f}%) for {ip}")
-
-        X_dev = client_df[feature_cols].values.astype(np.float32)
-        y_dev = client_df["label"].values.astype(np.int64)
-        X_tr, X_te, y_tr, y_te = _split_device(X_dev, y_dev, test_size, random_state, split_strategy)
-
-        client_names.append(ip)
-        train_features.append(X_tr)
-        test_features.append(X_te)
-        train_labels.append(y_tr)
-        test_labels.append(y_te)
-
-    if not client_names:
-        raise ValueError(
-            "No usable clients found — check partition_key, min_client_rows, "
-            "and that the label column mapping is correct."
-        )
-
-    print(f"\n  Final usable clients: {len(client_names)}")
-    for name, X_tr in zip(client_names, train_features):
-        print(f"    {name:<20} train rows: {len(X_tr)}")
-
-    X_train_all = np.vstack(train_features)
-    y_train_all = np.concatenate(train_labels)
-
-    if check_leakage:
-        print("\n[Leakage check — RAW feature space, before feature selection]")
-        check_train_test_leakage(train_features, test_features, client_names)
-
-    selected_idx = list(range(X_train_all.shape[1]))
-    if k_best_features is not None and k_best_features < X_train_all.shape[1]:
-        minmax = MinMaxScaler()
-        X_train_nonneg = minmax.fit_transform(X_train_all)
-        selector = SelectKBest(score_func=chi2, k=k_best_features)
-        selector.fit(X_train_nonneg, y_train_all)
-        selected_idx = np.where(selector.get_support())[0].tolist()
-        print(f"\nChi-squared feature selection: {X_train_all.shape[1]} -> {len(selected_idx)} features")
-
-        train_features = [X[:, selected_idx] for X in train_features]
-        test_features  = [X[:, selected_idx] for X in test_features]
-        X_train_all = np.vstack(train_features)
-
-        if check_leakage:
-            print(f"\n[Leakage check — reduced {len(selected_idx)}-feature space, for comparison only]")
-            check_train_test_leakage(train_features, test_features, client_names)
-
-    scaler = StandardScaler()
-    scaler.fit(X_train_all)
-
-    train_loaders, test_loaders = [], []
-    for X_tr, y_tr, X_te, y_te in zip(train_features, train_labels, test_features, test_labels):
-        X_tr = scaler.transform(X_tr)
-        X_te = scaler.transform(X_te)
-        train_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
-        test_ds  = TensorDataset(torch.tensor(X_te),  torch.tensor(y_te))
-        train_loaders.append(DataLoader(train_ds, batch_size=64, shuffle=True))
-        test_loaders.append(DataLoader(test_ds,  batch_size=64, shuffle=False))
-
-    print(f"\nTotal clients (devices): {len(train_loaders)}")
-    print(f"Feature dimensions    : {X_train_all.shape[1]}")
-    return train_loaders, test_loaders, scaler, selected_idx, client_names
-
-
-# =============================================================================
 # 2. DEMO / SYNTHETIC DATA (i used it to test the code before the real dataset for
 #  quicker development and testing)
 # =============================================================================
@@ -972,12 +773,22 @@ def evaluate_global_model(
     overall_acc = sum(p == t for p, t in zip(all_preds, all_targets)) / len(all_targets)
     # Macro-F1 treats both classes equally regardless of how imbalanced
     # they are — unlike accuracy, a model that just predicts the majority
-    # class on a 99%-skewed client scores poorly here, not well. This is
-    # used for model-selection/early-stopping instead of raw accuracy.
+    # class on a 99%-skewed client scores poorly here, not well.
     macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
+    # MCC (Matthews Correlation Coefficient) uses all four confusion-matrix
+    # quadrants (TP, TN, FP, FN) symmetrically, unlike F1 which weights
+    # toward the positive class. Range is -1 to +1 (0 = random, 1 = perfect,
+    # -1 = perfectly wrong) rather than F1's 0-to-1 range — thresholds
+    # tuned for F1 do NOT transfer directly to MCC. A model that just
+    # predicts the majority class on a skewed client scores MCC ~0, not a
+    # deceptively high number, same protection F1 gives but arguably more
+    # robust under imbalance since it penalises both false positives and
+    # false negatives symmetrically.
+    mcc = matthews_corrcoef(all_targets, all_preds)
     return {
         "overall_accuracy": overall_acc,
         "macro_f1": macro_f1,
+        "mcc": mcc,
         "per_client_accuracy": per_client_acc,
         "all_predictions": all_preds,
         "all_targets": all_targets,
@@ -1231,14 +1042,46 @@ def fine_tune(
     return model
 
 
+def compute_model_flops(model: nn.Module) -> dict:
+    """
+    Computes MACs (multiply-accumulate operations) and FLOPs for a single
+    forward pass, counting only nn.Linear layers (ReLU/Dropout are ~free
+    by comparison and standard practice omits them). Bias-add terms are
+    a small additional cost not counted here, consistent with how FLOPs
+    are typically reported for lightweight architectures in the literature
+    (e.g. MobileNet-style papers) — this is a slight underestimate, not
+    an overestimate.
+
+        MACs  = sum over Linear layers of (in_features * out_features)
+        FLOPs = 2 * MACs   (each MAC = 1 multiply + 1 add)
+    """
+    total_macs = 0
+    for module in model.net:
+        if isinstance(module, nn.Linear):
+            total_macs += module.in_features * module.out_features
+    return {"macs": total_macs, "flops": 2 * total_macs}
+
+
 def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
     """
-    Reports parameter count, non-zero parameter count (post-pruning), and
-    an approximate CPU inference latency per sample — a proxy for
-    Raspberry-Pi-class edge feasibility (no GPU available on such hardware).
+    Reports the standard set of metrics used to justify a "lightweight
+    model" claim in the FL-IDS / edge-deployment literature:
+
+      - Parameter count (total and non-zero, post-pruning)
+      - Model size on disk (KB) — actual serialized weight footprint,
+        directly relevant to storage-constrained IoT/edge devices
+      - FLOPs / MACs per inference — the standard computational-complexity
+        metric for comparing "lightweight" architectures (independent of
+        the benchmarking machine's speed, unlike latency)
+      - CPU inference latency per sample — a proxy for Raspberry-Pi-class
+        feasibility, since such devices have no GPU
+      - Throughput (samples/sec) — the inverse of latency, useful for
+        framing as "can this keep up with incoming traffic"
     """
     total_params = sum(p.numel() for p in model.parameters())
     nonzero_params = sum((p != 0).sum().item() for p in model.parameters())
+    model_size_kb = state_dict_size_bytes(model.state_dict()) / 1024
+    flop_stats = compute_model_flops(model)
 
     model.eval()
     dummy = torch.randn(1, input_size)
@@ -1250,10 +1093,252 @@ def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
         for _ in range(200):
             model(dummy)
         elapsed_ms = (time.perf_counter() - start) / 200 * 1000
+    throughput = 1000.0 / elapsed_ms if elapsed_ms > 0 else float("inf")
 
     print(f"  [{label}] Params: {total_params:,}  |  Non-zero: {nonzero_params:,} "
-          f"({100 * nonzero_params / total_params:.1f}%)  |  Avg CPU latency: {elapsed_ms:.3f} ms/sample")
-    return {"total_params": total_params, "nonzero_params": nonzero_params, "latency_ms": elapsed_ms}
+          f"({100 * nonzero_params / total_params:.1f}%)  |  Size: {model_size_kb:.2f} KB  |  "
+          f"MACs: {flop_stats['macs']:,}  |  FLOPs: {flop_stats['flops']:,}  |  "
+          f"Latency: {elapsed_ms:.3f} ms/sample  |  Throughput: {throughput:.0f} samples/sec")
+    return {
+        "total_params": total_params,
+        "nonzero_params": nonzero_params,
+        "model_size_kb": model_size_kb,
+        "macs": flop_stats["macs"],
+        "flops": flop_stats["flops"],
+        "latency_ms": elapsed_ms,
+        "throughput_samples_per_sec": throughput,
+    }
+
+
+def compare_model_footprints(baseline_stats: dict, optimized_stats: dict, label: str = "") -> dict:
+    """
+    Computes before/after reduction percentages between two benchmark_model()
+    results — the "X% smaller, Y% faster" numbers that actually justify a
+    lightweight-model claim, rather than reporting two sets of raw numbers
+    side by side and leaving the reader to do the subtraction.
+    """
+    def pct_reduction(before, after):
+        return 100 * (1 - after / before) if before else 0.0
+
+    comparison = {
+        "param_reduction_pct": pct_reduction(baseline_stats["total_params"], optimized_stats["nonzero_params"]),
+        "size_reduction_pct": pct_reduction(baseline_stats["model_size_kb"], optimized_stats["model_size_kb"]),
+        "flops_reduction_pct": pct_reduction(baseline_stats["flops"], optimized_stats["flops"]),
+        "latency_reduction_pct": pct_reduction(baseline_stats["latency_ms"], optimized_stats["latency_ms"]),
+        "speedup_factor": (baseline_stats["latency_ms"] / optimized_stats["latency_ms"]
+                            if optimized_stats["latency_ms"] > 0 else float("inf")),
+    }
+    print(f"\n  [{label}] vs baseline: "
+          f"{comparison['param_reduction_pct']:.1f}% fewer non-zero params, "
+          f"{comparison['size_reduction_pct']:.1f}% smaller on disk, "
+          f"{comparison['flops_reduction_pct']:.1f}% fewer FLOPs, "
+          f"{comparison['speedup_factor']:.2f}x faster inference")
+    return comparison
+
+
+# =============================================================================
+# 8b2. FEATURE COUNT SWEEP — empirically justify k_best_features
+# =============================================================================
+
+def run_feature_count_sweep(
+    loader_fn,
+    loader_kwargs: dict,
+    k_values: list[int],
+    hidden_size: int = 32,
+    num_classes: int = 2,
+    num_rounds: int = 6,
+    local_epochs: int = 2,
+    lr: float = 0.01,
+    weight_decay: float = 1e-4,
+    mu: float = 0.01,
+    min_acceptable_mcc: float | None = None,
+    selection_mode: str = "auto",
+) -> tuple[pd.DataFrame, int]:
+    """
+    Empirically justifies the choice of k_best_features by sweeping several
+    values and reporting accuracy, macro-F1, MCC, model size, and FLOPs for
+    each — instead of asserting a single number (e.g. "40") without evidence.
+
+    Selection is ranked by MCC (Matthews Correlation Coefficient), not
+    macro-F1. MCC uses all four confusion-matrix quadrants symmetrically
+    (TP, TN, FP, FN), which is generally considered more robust than F1
+    under class imbalance — relevant given this project's history of
+    severely skewed per-client label distributions. Macro-F1 and accuracy
+    are still reported in the table for reference/comparison, just not
+    used to rank.
+
+    IMPORTANT — MCC's range is -1 to +1 (0 = random, 1 = perfect, -1 =
+    perfectly wrong), NOT F1's 0-to-1 range. A threshold tuned for F1
+    (e.g. 0.85) does NOT mean the same thing for MCC — an MCC of 0.85 is
+    already very strong; don't reuse F1-scale thresholds here.
+
+    loader_fn: load_nbaiot_federated
+    loader_kwargs: all kwargs for loader_fn EXCEPT k_best_features (that's
+        swept). e.g. for N-BaIoT: {"dataset_root": DATASET_ROOT,
+        "max_samples_per_device": 5000, "check_leakage": False}
+        (leakage check is disabled here — this sweep already re-runs it
+        redundantly at every k; run it once separately instead)
+
+    selection_mode: which of FOUR philosophies to use for picking a
+    single k from the sweep results:
+
+      - "best":  picks the k with the HIGHEST MCC outright, ignoring
+        latency/size entirely. Note this will systematically drift toward
+        the LARGEST k in your range, since more features almost never
+        hurts MCC but always costs more latency/FLOPs — "best" is not
+        actually a lightweight-aware mode, even within a constrained range.
+
+      - "efficiency": picks the k with the highest MCC-per-millisecond
+        (MCC / latency_ms) — genuinely trades off performance against
+        system cost, rather than ignoring cost like "best" does. This is
+        the mode to use when you explicitly care about latency, not just
+        whether k_values was pre-constrained to a "reasonable" range.
+
+      - "floor": picks the SMALLEST k anywhere in the sweep whose MCC
+        clears min_acceptable_mcc, regardless of whether a larger k scores
+        higher. Use this when you have a wide k_values range and want the
+        lightest model that's merely "good enough", not the best performer.
+
+      - "auto" (default): backward-compatible behaviour — uses "floor" if
+        min_acceptable_mcc is set, otherwise "elbow" (smallest k within
+        0.02 MCC of the best MCC in the sweep — chases the ceiling first,
+        then economizes slightly).
+
+    Either way, look at the full table yourself before deciding — the
+    returned suggestion is a starting point, not a verdict. A Pareto-
+    frontier view (which k values are not dominated by any other k on
+    BOTH MCC and latency simultaneously) is always printed regardless of
+    selection_mode, since that's the most honest picture of the tradeoff.
+    """
+    rows = []
+    for k in k_values:
+        print(f"\n{'#'*60}\n  FEATURE COUNT SWEEP: k = {k}\n{'#'*60}")
+        kwargs = {**loader_kwargs, "k_best_features": k}
+        loaded = loader_fn(**kwargs)
+        train_loaders, test_loaders, scaler, selected_idx = loaded[0], loaded[1], loaded[2], loaded[3]
+        device_names = loaded[4] if len(loaded) > 4 else [f"Client_{i+1}" for i in range(len(train_loaders))]
+        input_size = len(selected_idx)
+
+        model, acc_hist, train_hist, stats = run_federated_learning(
+            algorithm="fedprox",
+            train_loaders=train_loaders,
+            test_loaders=test_loaders,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_classes=num_classes,
+            num_rounds=num_rounds,
+            local_epochs=local_epochs,
+            lr=lr,
+            weight_decay=weight_decay,
+            mu=mu,
+            device_names=device_names,
+        )
+
+        eval_result = evaluate_global_model(model, test_loaders, device_names, verbose=False)
+        bench = benchmark_model(model, input_size, label=f"k={k}")
+
+        # Efficiency = MCC achieved per millisecond of inference latency.
+        # Rewards k values that get good performance WITHOUT paying for it
+        # in latency, unlike "best" which ignores cost entirely. Guard
+        # against divide-by-zero / negative MCC producing a meaningless
+        # negative-latency-adjusted score.
+        mcc_val = eval_result["mcc"]
+        latency_val = bench["latency_ms"]
+        efficiency = (max(mcc_val, 0.0) / latency_val) if latency_val > 0 else 0.0
+
+        rows.append({
+            "k_features": k,
+            "Accuracy": round(eval_result["overall_accuracy"], 4),
+            "Macro-F1": round(eval_result["macro_f1"], 4),
+            "MCC": round(mcc_val, 4),
+            "Total Params": bench["total_params"],
+            "Model Size (KB)": round(bench["model_size_kb"], 2),
+            "FLOPs": bench["flops"],
+            "Latency (ms/sample)": round(latency_val, 4),
+            "Efficiency (MCC/ms)": round(efficiency, 2),
+        })
+
+    df = pd.DataFrame(rows)
+    print(f"\n{'='*60}\n  FEATURE COUNT SWEEP SUMMARY\n{'='*60}")
+    print(df.to_string(index=False))
+    # Sorted by size ascending too, so the size/accuracy tradeoff is visible
+    # at a glance regardless of which selection mode is used below.
+    print(f"\n  Sorted by Model Size (lightest first):")
+    print(df.sort_values("Model Size (KB)").to_string(index=False))
+
+    # Pareto frontier: a k is "dominated" if some OTHER k has both >= MCC
+    # AND <= latency (i.e. that other k is strictly better or equal on
+    # both axes). Non-dominated k values are the honest set of real
+    # tradeoff options — printed regardless of selection_mode.
+    is_dominated = []
+    for _, row in df.iterrows():
+        dominated = ((df["MCC"] >= row["MCC"]) & (df["Latency (ms/sample)"] < row["Latency (ms/sample)"])).any() or \
+                    ((df["MCC"] > row["MCC"]) & (df["Latency (ms/sample)"] <= row["Latency (ms/sample)"])).any()
+        is_dominated.append(dominated)
+    pareto_df = df[~pd.Series(is_dominated, index=df.index)].sort_values("Latency (ms/sample)")
+    print(f"\n  Pareto-optimal k values (MCC vs latency — no other k beats one of these on both axes):")
+    print(pareto_df[["k_features", "MCC", "Latency (ms/sample)", "Efficiency (MCC/ms)"]].to_string(index=False))
+
+    best_mcc = df["MCC"].max()
+
+    # Resolve "auto" into a concrete mode, for backward compatibility.
+    resolved_mode = selection_mode
+    if resolved_mode == "auto":
+        resolved_mode = "floor" if min_acceptable_mcc is not None else "elbow"
+
+    if resolved_mode == "best":
+        # Pure best-performer: ignores latency/size entirely. Will tend to
+        # pick the largest k in your range — see docstring warning above.
+        best_row = df.loc[df["MCC"].idxmax()]
+        suggested_k = best_row["k_features"]
+        print(f"\n  Best-performer selection: highest MCC among the tested k values (latency NOT considered)")
+        print(f"  Suggested k: {int(suggested_k)}  (MCC: {best_row['MCC']:.4f}, "
+              f"Latency: {best_row['Latency (ms/sample)']:.4f} ms/sample)")
+
+    elif resolved_mode == "efficiency":
+        # MCC-per-millisecond: genuinely trades off performance against cost.
+        best_row = df.loc[df["Efficiency (MCC/ms)"].idxmax()]
+        suggested_k = best_row["k_features"]
+        print(f"\n  Efficiency selection: highest MCC-per-millisecond among the tested k values")
+        print(f"  Suggested k: {int(suggested_k)}  (MCC: {best_row['MCC']:.4f}, "
+              f"Latency: {best_row['Latency (ms/sample)']:.4f} ms/sample, "
+              f"Efficiency: {best_row['Efficiency (MCC/ms)']:.2f} MCC/ms)")
+        print(f"  For comparison, the highest raw MCC in the sweep was "
+              f"{best_mcc:.4f} at k={int(df.loc[df['MCC'].idxmax(), 'k_features'])} "
+              f"(latency {df.loc[df['MCC'].idxmax(), 'Latency (ms/sample)']:.4f} ms/sample) — "
+              f"efficiency selection may trade some of that MCC away for lower latency.")
+
+    elif resolved_mode == "floor":
+        # Lightweight-first: smallest k anywhere that clears the floor,
+        # regardless of how much better a bigger k scores.
+        if min_acceptable_mcc is None:
+            raise ValueError("selection_mode='floor' requires min_acceptable_mcc to be set.")
+        acceptable = df[df["MCC"] >= min_acceptable_mcc].sort_values("k_features")
+        if len(acceptable) == 0:
+            print(f"\n  WARNING: no k in the sweep reached min_acceptable_mcc={min_acceptable_mcc:.4f} "
+                  f"(best achieved was {best_mcc:.4f}). Falling back to the k with the best MCC in the sweep — "
+                  f"lower min_acceptable_mcc or extend k_values and re-run if this isn't good enough.")
+            suggested_k = df.loc[df["MCC"].idxmax(), "k_features"]
+        else:
+            suggested_k = acceptable.iloc[0]["k_features"]
+            print(f"\n  Lightweight-first selection: smallest k clearing MCC >= {min_acceptable_mcc:.4f}")
+            print(f"  Suggested k: {int(suggested_k)}  (MCC at this k: {acceptable.iloc[0]['MCC']:.4f}, "
+                  f"vs best MCC in sweep: {best_mcc:.4f} at k={int(df.loc[df['MCC'].idxmax(), 'k_features'])})")
+
+    else:  # "elbow"
+        # Smallest k within 0.02 MCC of the ceiling (scaled down from the
+        # old 1-percentage-point F1 margin, since MCC's -1..+1 range means
+        # a 0.01 gap is proportionally larger than the same gap in F1).
+        candidates = df[df["MCC"] >= best_mcc - 0.02].sort_values("k_features")
+        suggested_k = candidates.iloc[0]["k_features"]
+        print(f"\n  Elbow selection: smallest k within 0.02 of best MCC ({best_mcc:.4f})")
+        print(f"  Suggested k: {int(suggested_k)}")
+
+    print("  (This is a starting point, not an automatic answer — review the full table above.)")
+
+    df.to_csv("feature_count_sweep_results.csv", index=False)
+    print("\nSweep results saved to: feature_count_sweep_results.csv")
+    return df, int(suggested_k)
 
 
 # =============================================================================
@@ -1330,6 +1415,11 @@ def run_ablation_study(
         bench = benchmark_model(model, input_size, label=name)
         kb_sent = stats["total_bytes_after"] / 1024 if stats["total_bytes_after"] else 0.0
 
+        if name == "1. Baseline":
+            baseline_bench = bench   # every later config compares its footprint reduction against this
+
+        comparison = compare_model_footprints(baseline_bench, bench, label=name)
+
         rows.append({
             "Config": name,
             "Final Accuracy": round(final_acc, 4),
@@ -1337,7 +1427,12 @@ def run_ablation_study(
             "Total KB Sent": round(kb_sent, 1),
             "Total Params": bench["total_params"],
             "Non-zero Params": bench["nonzero_params"],
+            "Model Size (KB)": round(bench["model_size_kb"], 2),
+            "FLOPs": bench["flops"],
             "Latency (ms/sample)": round(bench["latency_ms"], 4),
+            "Throughput (samples/sec)": round(bench["throughput_samples_per_sec"], 0),
+            "Size Reduction vs Baseline (%)": round(comparison["size_reduction_pct"], 1),
+            "Speedup vs Baseline (x)": round(comparison["speedup_factor"], 2),
         })
 
     df = pd.DataFrame(rows)
@@ -1483,45 +1578,29 @@ def plot_convergence(
 
 def main():
     # ------------------------------------------------------------------
-    # Dataset loading
+    # STEP 1: Load the dataset.
+    #
+    # If the N-BaIoT folder exists on this computer, we use the real
+    # data. Otherwise, we generate fake ("synthetic") data so the script
+    # can still be tested without needing the real dataset downloaded.
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Dataset loading — X-IIoTID (primary), falling back to N-BaIoT, then
-    # synthetic data for development if neither is present.
-    # ------------------------------------------------------------------
-    use_xiiotid  = XIIOTID_CSV_PATH.exists()
-    use_nbaiot   = (not use_xiiotid) and DATASET_ROOT.exists()
+    use_real_data = DATASET_ROOT.exists()
 
-    # k_best_features implements the "Lightweight Model Design" feature-selection
-    # goal: shrinking the raw feature set to a smaller chi-squared-selected subset.
-    K_BEST_FEATURES = 40
+    # How many of the 115 original features to keep after feature
+    # selection. Fewer features = a smaller, faster ("lightweight") model,
+    # but too few can hurt accuracy. This number should be chosen using
+    # feature_sweep.py (a separate script), not guessed — run that script
+    # once, look at its results table, then set this number here.
+    K_BEST_FEATURES = 60
 
-    # SPLIT_STRATEGY controls the leakage investigation:
-    #   "random" — original behaviour (stratified random split per device)
-    #   "time"   — chronological split (first rows = train, last = test,
-    #              no shuffling) — the standard fix if check_train_test_leakage
-    #              below reports meaningful near-duplicate rates under "random"
+    # How to split each device's data into "train" and "test" portions:
+    #   "random" — shuffle the rows randomly before splitting (default)
+    #   "time"   — keep the original row order; first rows = train, last
+    #              rows = test. Useful for checking that "random" isn't
+    #              accidentally leaking very similar rows across the split.
     SPLIT_STRATEGY = "random"
 
-    # Which network host becomes the partition key for X-IIoTID:
-    #   "Scr_IP" — partitions by the host that INITIATED each flow
-    #   "Des_IP" — partitions by the host that RECEIVED each flow (the
-    #              device being targeted) — conceptually closer to "each
-    #              device runs its own local IDS", worth testing both.
-    XIIOTID_PARTITION_KEY = "Scr_IP"
-
-    if use_xiiotid:
-        print("X-IIoTID dataset found — loading...")
-        train_loaders, test_loaders, scaler, selected_idx, device_names = load_xiiotid_federated(
-            csv_path=XIIOTID_CSV_PATH,
-            partition_key=XIIOTID_PARTITION_KEY,
-            max_samples_per_device=5000,
-            k_best_features=K_BEST_FEATURES,
-            split_strategy=SPLIT_STRATEGY,
-            check_leakage=True,
-        )
-        input_size = len(selected_idx)
-    elif use_nbaiot:
+    if use_real_data:
         print("Real N-BaIoT dataset found — loading...")
         train_loaders, test_loaders, scaler, selected_idx, device_names = load_nbaiot_federated(
             dataset_root=DATASET_ROOT,
@@ -1532,10 +1611,9 @@ def main():
         )
         input_size = len(selected_idx)
     else:
-        print("Neither X-IIoTID nor N-BaIoT dataset found.")
-        print("Running with SYNTHETIC Non-IID data for development.\n")
-        print(f"  To use X-IIoTID: place the CSV at '{XIIOTID_CSV_PATH}'")
-        print(f"  To use N-BaIoT: set DATASET_ROOT at the top of this file\n")
+        print(f"N-BaIoT dataset not found at '{DATASET_ROOT}'.")
+        print("Running with FAKE (synthetic) data instead, just so the script can still run.\n")
+        print(f"  To use the real dataset: put the N-BaIoT folder at '{DATASET_ROOT}'\n")
         train_loaders, test_loaders = make_synthetic_noniid_loaders(
             num_clients=9, input_size=115, samples_per_client=1000
         )
@@ -1562,11 +1640,11 @@ def main():
     # ------------------------------------------------------------------
     CONFIG = dict(
         input_size   = input_size,
-        hidden_size  = 32,
+        hidden_size  = 20,
         num_classes  = 2,
-        num_rounds   = 8,
+        num_rounds   = 10,
         local_epochs = 2,
-        lr           = 0.01,
+        lr           = 0.001,
         weight_decay = 1e-4,
         client_fraction = 0.7,
         conditional_update_delta = 1e-3,
@@ -1592,7 +1670,7 @@ def main():
         train_loaders=train_loaders,
         test_loaders=test_loaders,
         device_names=device_names,
-        mu=0.001,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
+        mu=0.005,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
         **CONFIG,
     )
 
