@@ -1,32 +1,3 @@
-"""
-feature_sweep.py
-
-A separate, standalone script that helps you pick K_BEST_FEATURES (how
-many of the 115 N-BaIoT features to keep) for fl_ids_nbaiot.py.
-
-WHY THIS IS A SEPARATE FILE:
-Testing several different feature counts means running federated training
-several times in a row, which takes a while. Keeping it separate means
-your normal, everyday runs of fl_ids_nbaiot.py stay fast — you only run
-this file when you actually want to (re)check what K_BEST_FEATURES should
-be, not every single time.
-
-HOW TO USE THIS FILE:
-1. Make sure the N-BaIoT dataset folder is in the same folder as this
-   script (same as fl_ids_nbaiot.py needs it).
-2. Run:  python feature_sweep.py
-3. Wait for it to finish (it trains several small models, one per feature
-   count in K_SWEEP_VALUES below — this can take a few minutes).
-4. Read the printed table. It shows accuracy / MCC / latency for each
-   feature count tested.
-5. At the end it prints a suggested K_BEST_FEATURES value. Look at the
-   table yourself before trusting it — then go update K_BEST_FEATURES in
-   fl_ids_nbaiot.py's main() function to match your decision.
-
-This script imports everything it needs from fl_ids_nbaiot.py — no code
-is copied or duplicated between the two files.
-"""
-
 from fl_ids_nbaiot import (
     run_feature_count_sweep,
     load_nbaiot_federated,
@@ -38,20 +9,10 @@ from fl_ids_nbaiot import (
 # ------------------------------------------------------------------
 # Sweep configuration — adjust as needed
 # ------------------------------------------------------------------
-
-# Which feature counts to test. Only include numbers you'd actually be
-# comfortable using in your final report — the script will only ever
-# recommend a number from this list, it won't suggest anything outside it.
 K_SWEEP_VALUES = [50,60,65,70,75]
 
-# How many federated learning "rounds" to use for each test. Lower than
-# your main training run's round count on purpose — this script already
-# runs one full training PER value in K_SWEEP_VALUES above, so keeping
-# each one shorter keeps the total time reasonable.
 K_SWEEP_ROUNDS = 5
 
-# HOW TO PICK THE "BEST" FEATURE COUNT — pick one of these three:
-#
 #   "efficiency" — picks the feature count that gives the best performance
 #                  PER MILLISECOND of processing time. Recommended if you
 #                  care about keeping the model fast/lightweight.
@@ -67,9 +28,6 @@ K_SWEEP_ROUNDS = 5
 #                  bigger number would score higher.
 SELECTION_MODE = "efficiency"
 
-# Only used if SELECTION_MODE = "floor" above.
-# MCC ranges from -1 (worst) to +1 (perfect), with 0 meaning "random
-# guessing". This is NOT the same scale as accuracy or F1-score.
 MIN_ACCEPTABLE_MCC = 0.7
 
 

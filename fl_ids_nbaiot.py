@@ -1,12 +1,3 @@
-"""
-Federated Learning Intrusion Detection System — N-BaIoT Dataset
-================================================================
-Implements FedAvg (baseline) and FedProx (Non-IID optimisation)
-as outlined in: "Optimising Federated Learning Based Intrusion Detection
-for IoT Systems" — Sakshi Mahajan, MSc CS (Data Analytics), Uni. of Galway
-
-"""
-
 import os
 import copy
 import numpy as np
@@ -51,21 +42,7 @@ def _split_device(
     random_state: int,
     split_strategy: str = "random",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Splits one device's data into train/test.
-
-    split_strategy:
-      "random" — the original behaviour: sklearn's stratified random split.
-                 If the underlying CSV rows are temporally adjacent capture
-                 windows, a random split can place near-identical rows from
-                 the same attack burst on both sides — this is the N-BaIoT
-                 leakage pattern.
-      "time"   — takes the CSV's row order as a time axis: the first
-                 (1 - test_size) fraction of rows become train, the last
-                 fraction become test, with NO shuffling. This keeps whole
-                 attack bursts on one side of the split, which is the
-                 standard fix for this kind of leakage.
-    """
+    
     if split_strategy == "time":
         n = len(X)
         split_at = int(n * (1 - test_size))
@@ -83,23 +60,6 @@ def check_train_test_leakage(
     max_test_samples_checked: int = 3000,
     random_state: int = 42,
 ) -> dict:
-    """
-    Per-device leakage check between a client's train and test split.
-
-    Reports, for each device:
-      - exact duplicate rows appearing in both train and test
-      - near-duplicate rows: test rows whose nearest neighbour in the
-        train set is within `near_dup_distance` (raw, unscaled feature
-        space). This is the specific N-BaIoT leakage pattern — consecutive
-        flow-capture windows during the same attack burst produce near-
-        identical statistical features, so a random split can leak an
-        almost-identical row across the split.
-
-    Uses a KD-tree per device so this stays fast even on large clients;
-    test rows are subsampled if there are more than `max_test_samples_checked`.
-    A near-duplicate rate above ~5% is a strong signal that reported
-    accuracy is inflated by leakage rather than genuine generalisation.
-    """
     print("\n" + "=" * 60)
     print("  TRAIN/TEST LEAKAGE CHECK")
     print("=" * 60)
@@ -193,17 +153,6 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
     combined = pd.concat(dfs, ignore_index=True)
     combined = combined.dropna()
 
-    # N-BaIoT's raw CSVs contain genuine duplicate flow-statistic rows
-    # (not just near-duplicates from adjacent capture windows). If these
-    # survive into both the train and test split, the model "generalizes"
-    # by recognising rows it was literally trained on. Dedup here, before
-    # any split, so duplicates can't land on both sides.
-    #
-    # Dedup at float32 precision, matching what the model actually sees
-    # downstream (features get cast to float32 for training) — two rows
-    # that differ only past float32's ~7 significant digits are, for the
-    # model's purposes, the same row, even if pandas' float64 view treats
-    # them as distinct.
     feature_cols = [c for c in combined.columns if c != "label"]
     n_before = len(combined)
     dup_mask = combined[feature_cols].astype(np.float32).duplicated()
@@ -236,9 +185,6 @@ def load_flat_device_data(dataset_root: Path, device_id: str) -> pd.DataFrame:
     combined = pd.concat(dfs, ignore_index=True)
     combined = combined.dropna()
 
-    # Same rationale as load_device_data: dedup at float32 precision (what
-    # the model actually sees) before any split, so duplicates can't leak
-    # across train/test.
     feature_cols = [c for c in combined.columns if c != "label"]
     n_before = len(combined)
     dup_mask = combined[feature_cols].astype(np.float32).duplicated()
@@ -263,7 +209,7 @@ def load_nbaiot_federated(
     """
     Loads N-BaIoT data and partitions it into per-device (Non-IID) FL clients.
 
-    Each IoT device naturally produces a different traffic distribution —
+    Each IoT device naturally produces a different traffic distribution.
     this is the real Non-IID problem described in the research gaps.
 
     Returns:
@@ -347,14 +293,7 @@ def load_nbaiot_federated(
     y_train_all = np.concatenate(train_labels)
 
     # ------------------------------------------------------------------
-    # Leakage check on the RAW feature space (before any reduction).
-    # This is the scientifically meaningful check: it asks whether the
-    # original flow records themselves are duplicated/near-identical
-    # across train/test. Checking AFTER chi2 selection would be wrong —
-    # N-BaIoT's 115 features are highly redundant by construction (the
-    # same stats computed over 5 overlapping time windows), so collapsing
-    # to k_best_features can make genuinely distinct rows collide in the
-    # reduced space and look like leakage that isn't really there.
+    # Leakage check on the RAW feature space (before any reduction)
     # ------------------------------------------------------------------
     if check_leakage:
         print("\n[Leakage check — RAW 115-feature space, before feature selection]")
@@ -363,7 +302,7 @@ def load_nbaiot_federated(
     # ------------------------------------------------------------------
     # Chi-squared feature selection (115 -> k_best_features)
     # chi2 requires non-negative inputs, so we min-max scale first, select
-    # the top-k features on the *global* training pool, then z-score only
+    # the top-k features on the global training pool, then z-score only
     # the retained columns for the models. This is what shrinks the model
     # for lightweight / Raspberry-Pi-class inference.
     # ------------------------------------------------------------------
@@ -455,63 +394,63 @@ def split_train_validation_loaders(
     return train_sub_loaders, val_loaders
 
 
-# =============================================================================
-# 2. DEMO / SYNTHETIC DATA (i used it to test the code before the real dataset for
-#  quicker development and testing)
-# =============================================================================
+# # =============================================================================
+# # 2. DEMO / SYNTHETIC DATA (i used it to test the code before the real dataset for
+# #  quicker development and testing)
+# # =============================================================================
 
-def make_synthetic_noniid_loaders(
-    num_clients: int = 9,
-    input_size: int = 115,
-    num_classes: int = 2,
-    samples_per_client: int = 1000,
-    random_state: int = 42,
-) -> tuple[list[DataLoader], list[DataLoader]]:
-    """
-    Synthetic Non-IID data that mimics the N-BaIoT heterogeneity:
-      - Each device has a different class-imbalance ratio
-        (some cameras mostly see attacks; thermostats mostly benign)
-      - Feature distributions are shifted per device
+# def make_synthetic_noniid_loaders(
+#     num_clients: int = 9,
+#     input_size: int = 115,
+#     num_classes: int = 2,
+#     samples_per_client: int = 1000,
+#     random_state: int = 42,
+# ) -> tuple[list[DataLoader], list[DataLoader]]:
+#     """
+#     Synthetic Non-IID data that mimics the N-BaIoT heterogeneity:
+#       - Each device has a different class-imbalance ratio
+#         (some cameras mostly see attacks; thermostats mostly benign)
+#       - Feature distributions are shifted per device
 
-    Use this for development/testing before the real dataset is available.
-    """
-    np.random.seed(random_state)
-    torch.manual_seed(random_state)
+#     Use this for development/testing before the real dataset is available.
+#     """
+#     np.random.seed(random_state)
+#     torch.manual_seed(random_state)
 
-    # Create attack ratios for each client (0.05 to 0.95)
-    attack_ratios = np.linspace(0.05, 0.95, num_clients)
+#     # Create attack ratios for each client (0.05 to 0.95)
+#     attack_ratios = np.linspace(0.05, 0.95, num_clients)
 
-    train_loaders, test_loaders = [], []
+#     train_loaders, test_loaders = [], []
 
 
-    for i in range(num_clients):
-        ratio = attack_ratios[i]
-        n_attack = int(samples_per_client * ratio)
-        n_benign = samples_per_client - n_attack
+#     for i in range(num_clients):
+#         ratio = attack_ratios[i]
+#         n_attack = int(samples_per_client * ratio)
+#         n_benign = samples_per_client - n_attack
 
-        # Device-specific feature shift simulates different traffic patterns
-        device_shift = np.random.randn(input_size).astype(np.float32) * 0.5
+#         # Device-specific feature shift simulates different traffic patterns
+#         device_shift = np.random.randn(input_size).astype(np.float32) * 0.5
 
-        benign_feat = np.random.randn(n_benign, input_size).astype(np.float32) + device_shift
-        attack_feat = np.random.randn(n_attack, input_size).astype(np.float32) + device_shift + 1.5
+#         benign_feat = np.random.randn(n_benign, input_size).astype(np.float32) + device_shift
+#         attack_feat = np.random.randn(n_attack, input_size).astype(np.float32) + device_shift + 1.5
 
-        X = np.vstack([benign_feat, attack_feat])
-        y = np.array([0] * n_benign + [1] * n_attack, dtype=np.int64)
+#         X = np.vstack([benign_feat, attack_feat])
+#         y = np.array([0] * n_benign + [1] * n_attack, dtype=np.int64)
 
-        perm = np.random.permutation(len(y))
-        X, y = X[perm], y[perm]
+#         perm = np.random.permutation(len(y))
+#         X, y = X[perm], y[perm]
 
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=random_state)
+#         X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=random_state)
 
-        train_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
-        test_ds  = TensorDataset(torch.tensor(X_te),  torch.tensor(y_te))
+#         train_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
+#         test_ds  = TensorDataset(torch.tensor(X_te),  torch.tensor(y_te))
 
-        train_loaders.append(DataLoader(train_ds, batch_size=64, shuffle=True))
-        test_loaders.append(DataLoader(test_ds,  batch_size=64, shuffle=False))
+#         train_loaders.append(DataLoader(train_ds, batch_size=64, shuffle=True))
+#         test_loaders.append(DataLoader(test_ds,  batch_size=64, shuffle=False))
 
-    print(f"[Synthetic Non-IID] Created {num_clients} clients with varying attack ratios.")
-    print(f"  Attack ratios: {[f'{r:.2f}' for r in attack_ratios]}")
-    return train_loaders, test_loaders
+#     print(f"[Synthetic Non-IID] Created {num_clients} clients with varying attack ratios.")
+#     print(f"  Attack ratios: {[f'{r:.2f}' for r in attack_ratios]}")
+#     return train_loaders, test_loaders
 
 
 # =============================================================================
@@ -539,14 +478,14 @@ class SimpleMLP(nn.Module):
 
 
 # =============================================================================
-# 3b. CLASS-WEIGHT HELPER — for severe per-client label skew
+# 3b. CLASS-WEIGHT HELPER for severe per-client label skew
 # =============================================================================
 
 def compute_class_weights(loader: DataLoader, num_classes: int = 2) -> torch.Tensor:
     """
     Computes inverse-frequency class weights from a single client's own
     local training labels (not the global dataset). Used to counteract
-    severe per-client label skew — e.g. a client whose local data is 99%
+    severe per-client label skew e.g. a client whose local data is 99%
     one class, where an unweighted loss lets gradients from the majority
     class dominate and the model never learns the minority class on that
     client, even for data it directly trained on.
@@ -581,7 +520,7 @@ def client_update_fedavg(
     class_weights (optional): per-class weights passed to CrossEntropyLoss,
     computed from THIS client's own local label distribution. Critical
     under severe per-client label skew (e.g. a client that's 99% one
-    class) — without this, the loss gradient is dominated by the majority
+    class). without this, the loss gradient is dominated by the majority
     class and the model learns almost nothing about the minority class on
     that client, which then drags down that client's own precision/recall
     even on data it trained on.
@@ -634,21 +573,10 @@ def client_update_fedprox(
       - Without the term, local models overfit their own distribution
       - With μ > 0, updates stay anchored near the global optimum
 
-    class_weights (optional): per-class weights computed from this
-    client's own local label distribution, passed to CrossEntropyLoss.
-    Note this addresses a DIFFERENT problem than μ: μ corrects for
-    parameter/feature drift between clients; class_weights corrects for
-    label-distribution skew WITHIN a client's own local training. Both
-    can be needed at once under severe non-IID label skew.
-
-    Args:
-        mu: proximal coefficient (0 = pure FedAvg; higher = tighter anchor)
-            Typical range: 0.001 – 0.1. Start with 0.01 for N-BaIoT.
     """
     client_model.train()
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    # Freeze a snapshot of the global weights (used in proximal term)
     global_params = {
         name: param.detach().clone()
         for name, param in global_model.named_parameters()
@@ -661,7 +589,7 @@ def client_update_fedprox(
         for data, target in train_loader:
             optimizer.zero_grad()
 
-            # --- Task loss (cross-entropy) ---
+            # Task loss (cross-entropy)
             task_loss = criterion(client_model(data), target)
 
             #  Proximal term: penalise drift from global model 
@@ -693,7 +621,7 @@ def quantize_state_dict(state_dict: dict, dtype: torch.dtype = torch.float16) ->
 
     Casting the client's weight tensors to float16 halves the payload size
     before "transmission". The server upcasts back to float32 before
-    aggregating, so training precision is unaffected — only the simulated
+    aggregating, so training precision is unaffected, only the simulated
     wire size changes. Returns the quantised dict plus nothing else; use
     `state_dict_size_bytes` to measure the before/after payload.
     """
@@ -771,19 +699,13 @@ def evaluate_global_model(
                 print(f"    {name:<45} Acc: {acc:.4f}")
 
     overall_acc = sum(p == t for p, t in zip(all_preds, all_targets)) / len(all_targets)
-    # Macro-F1 treats both classes equally regardless of how imbalanced
-    # they are — unlike accuracy, a model that just predicts the majority
-    # class on a 99%-skewed client scores poorly here, not well.
+    
     macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
     # MCC (Matthews Correlation Coefficient) uses all four confusion-matrix
     # quadrants (TP, TN, FP, FN) symmetrically, unlike F1 which weights
     # toward the positive class. Range is -1 to +1 (0 = random, 1 = perfect,
     # -1 = perfectly wrong) rather than F1's 0-to-1 range — thresholds
-    # tuned for F1 do NOT transfer directly to MCC. A model that just
-    # predicts the majority class on a skewed client scores MCC ~0, not a
-    # deceptively high number, same protection F1 gives but arguably more
-    # robust under imbalance since it penalises both false positives and
-    # false negatives symmetrically.
+    # tuned for F1 do NOT transfer directly to MCC.
     mcc = matthews_corrcoef(all_targets, all_preds)
     return {
         "overall_accuracy": overall_acc,
@@ -818,13 +740,13 @@ def run_federated_learning(
     client_fraction: float = 1.0,      # Client selection: fraction of clients sampled per round
     conditional_update_delta: float = 0.0,  # Skip an update if local loss doesn't improve by at least this much
     quantize_updates: bool = False,    # Simulate uplink compression (float32 -> float16)
-    use_class_weights: bool = True,    # Per-client inverse-frequency class weighting — critical under label skew
+    use_class_weights: bool = True,    # Per-client inverse-frequency class weighting
     random_state: int = 42,
 ) -> tuple[nn.Module, list[float], list[float], dict]:
     """
     Main federated learning loop.
 
-    FedAvg:   standard averaging — all clients train freely
+    FedAvg:   standard averaging; all clients train freely
     FedProx:  adds proximal term μ/2 ||w - w_global||² to each client's loss
 
     Returns the trained global model, round-by-round test accuracy history,
@@ -856,17 +778,16 @@ def run_federated_learning(
     best_val_metric = float("-inf")
     best_model_state = copy.deepcopy(global_model.state_dict())
     stale_rounds = 0
-    best_round = 0                    # 1-indexed round that produced best_model_state — proxy for "rounds to converge"
+    best_round = 0                    # 1-indexed round that produced best_model_state. proxy for "rounds to converge"
     total_bytes_before = 0            # cumulative uncompressed uplink payload across the whole run
-    total_bytes_after = 0             # cumulative payload actually "sent" (post-compression if enabled)
+    total_bytes_after = 0             # cumulative payload actually "sent"
 
     for round_idx in range(num_rounds):
-        # ------------------------------------------------------------
         # Client selection: sample a fraction of clients this round
         # (mirrors real cross-device FL, e.g. "top 20 of 100 devices").
         # With client_fraction=1.0 (default) all clients participate,
         # matching the original 9-device behaviour.
-        # ------------------------------------------------------------
+
         n_selected = max(1, int(round(num_clients * client_fraction)))
         rng = np.random.RandomState(random_state + round_idx)
         selected_clients = sorted(rng.choice(num_clients, size=n_selected, replace=False).tolist())
@@ -898,20 +819,11 @@ def run_federated_learning(
                     epochs=local_epochs, mu=mu, class_weights=class_weights,
                 )
 
-            # ------------------------------------------------------------
-            # Conditional update: only ship this client's weights to the
-            # server if local loss improved by at least `conditional_update_delta`.
-            # Skipping stale/unhelpful updates cuts uplink traffic.
-            # ------------------------------------------------------------
             improvement = (loss_before or 0.0) - (loss_after or 0.0)
             if conditional_update_delta > 0 and improvement < conditional_update_delta:
                 skipped_clients += 1
                 continue
 
-            # ------------------------------------------------------------
-            # Update compression: simulate halving the payload with fp16
-            # before it goes "over the wire" to the server.
-            # ------------------------------------------------------------
             bytes_before += state_dict_size_bytes(weights)
             if quantize_updates:
                 weights = quantize_state_dict(weights)          # fp32 -> fp16 ("on the wire")
@@ -932,7 +844,7 @@ def run_federated_learning(
         total_bytes_after += bytes_after
 
         if not client_weights:
-            print("  No client updates this round — keeping previous global model.")
+            print("  No client updates this round. Keeping previous global model.")
         else:
             # Aggregate on server
             global_model = server_aggregate(global_model, client_weights, client_sizes)
@@ -944,10 +856,6 @@ def run_federated_learning(
         val_macro_f1 = val_results["macro_f1"]
         print(f"  Validation macro-F1: {val_macro_f1:.4f}  (accuracy: {val_accuracy:.4f})")
 
-        # Model selection uses macro-F1, not raw accuracy — under severe
-        # per-client label skew, a model that just predicts the majority
-        # class scores deceptively high accuracy while doing nothing
-        # useful; macro-F1 penalises that.
         if val_macro_f1 > best_val_metric + min_delta:
             best_val_metric = val_macro_f1
             best_model_state = copy.deepcopy(global_model.state_dict())
@@ -961,10 +869,6 @@ def run_federated_learning(
         overall = results["overall_accuracy"]
         accuracy_history.append(overall)
 
-        # Train-side accuracy (same clients' train_loaders, silent) — the gap
-        # between this and `overall` (test) is the actual overfitting signal.
-        # A flat test curve alone (like the round-by-round print above) does
-        # NOT show overfitting on its own.
         train_results = evaluate_global_model(global_model, train_loaders, device_names, verbose=False)
         train_accuracy_history.append(train_results["overall_accuracy"])
 
@@ -1002,9 +906,8 @@ def prune_global_model(
 
     Zeroes out the smallest-magnitude `amount` fraction of weights in each
     Linear layer. The pruning mask stays registered (not yet "removed") so
-    that a subsequent fine-tuning pass can't undo the zeros — call
-    `finalize_pruning()` once fine-tuning is done to bake the mask in
-    permanently. This is what shrinks the effective parameter count for
+    that a subsequent fine-tuning pass can't undo the zeros once fine-tuning is done 
+    to bake the mask in permanently. This is what shrinks the effective parameter count for
     Raspberry-Pi-class inference, per the "Lightweight Model Design" goal.
     """
     pruned = copy.deepcopy(model)
@@ -1045,12 +948,9 @@ def fine_tune(
 def compute_model_flops(model: nn.Module) -> dict:
     """
     Computes MACs (multiply-accumulate operations) and FLOPs for a single
-    forward pass, counting only nn.Linear layers (ReLU/Dropout are ~free
+    forward pass, counting only nn.Linear layers (ReLU/Dropout are free
     by comparison and standard practice omits them). Bias-add terms are
-    a small additional cost not counted here, consistent with how FLOPs
-    are typically reported for lightweight architectures in the literature
-    (e.g. MobileNet-style papers) — this is a slight underestimate, not
-    an overestimate.
+    a small additional cost not counted here
 
         MACs  = sum over Linear layers of (in_features * out_features)
         FLOPs = 2 * MACs   (each MAC = 1 multiply + 1 add)
@@ -1068,14 +968,14 @@ def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
     model" claim in the FL-IDS / edge-deployment literature:
 
       - Parameter count (total and non-zero, post-pruning)
-      - Model size on disk (KB) — actual serialized weight footprint,
+      - Model size on disk (KB) : actual serialized weight footprint,
         directly relevant to storage-constrained IoT/edge devices
-      - FLOPs / MACs per inference — the standard computational-complexity
+      - FLOPs / MACs per inference : the standard computational-complexity
         metric for comparing "lightweight" architectures (independent of
         the benchmarking machine's speed, unlike latency)
-      - CPU inference latency per sample — a proxy for Raspberry-Pi-class
+      - CPU inference latency per sample : a proxy for Raspberry-Pi-class
         feasibility, since such devices have no GPU
-      - Throughput (samples/sec) — the inverse of latency, useful for
+      - Throughput (samples/sec) : the inverse of latency, useful for
         framing as "can this keep up with incoming traffic"
     """
     total_params = sum(p.numel() for p in model.parameters())
@@ -1113,9 +1013,6 @@ def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
 def compare_model_footprints(baseline_stats: dict, optimized_stats: dict, label: str = "") -> dict:
     """
     Computes before/after reduction percentages between two benchmark_model()
-    results — the "X% smaller, Y% faster" numbers that actually justify a
-    lightweight-model claim, rather than reporting two sets of raw numbers
-    side by side and leaving the reader to do the subtraction.
     """
     def pct_reduction(before, after):
         return 100 * (1 - after / before) if before else 0.0
@@ -1154,62 +1051,6 @@ def run_feature_count_sweep(
     min_acceptable_mcc: float | None = None,
     selection_mode: str = "auto",
 ) -> tuple[pd.DataFrame, int]:
-    """
-    Empirically justifies the choice of k_best_features by sweeping several
-    values and reporting accuracy, macro-F1, MCC, model size, and FLOPs for
-    each — instead of asserting a single number (e.g. "40") without evidence.
-
-    Selection is ranked by MCC (Matthews Correlation Coefficient), not
-    macro-F1. MCC uses all four confusion-matrix quadrants symmetrically
-    (TP, TN, FP, FN), which is generally considered more robust than F1
-    under class imbalance — relevant given this project's history of
-    severely skewed per-client label distributions. Macro-F1 and accuracy
-    are still reported in the table for reference/comparison, just not
-    used to rank.
-
-    IMPORTANT — MCC's range is -1 to +1 (0 = random, 1 = perfect, -1 =
-    perfectly wrong), NOT F1's 0-to-1 range. A threshold tuned for F1
-    (e.g. 0.85) does NOT mean the same thing for MCC — an MCC of 0.85 is
-    already very strong; don't reuse F1-scale thresholds here.
-
-    loader_fn: load_nbaiot_federated
-    loader_kwargs: all kwargs for loader_fn EXCEPT k_best_features (that's
-        swept). e.g. for N-BaIoT: {"dataset_root": DATASET_ROOT,
-        "max_samples_per_device": 5000, "check_leakage": False}
-        (leakage check is disabled here — this sweep already re-runs it
-        redundantly at every k; run it once separately instead)
-
-    selection_mode: which of FOUR philosophies to use for picking a
-    single k from the sweep results:
-
-      - "best":  picks the k with the HIGHEST MCC outright, ignoring
-        latency/size entirely. Note this will systematically drift toward
-        the LARGEST k in your range, since more features almost never
-        hurts MCC but always costs more latency/FLOPs — "best" is not
-        actually a lightweight-aware mode, even within a constrained range.
-
-      - "efficiency": picks the k with the highest MCC-per-millisecond
-        (MCC / latency_ms) — genuinely trades off performance against
-        system cost, rather than ignoring cost like "best" does. This is
-        the mode to use when you explicitly care about latency, not just
-        whether k_values was pre-constrained to a "reasonable" range.
-
-      - "floor": picks the SMALLEST k anywhere in the sweep whose MCC
-        clears min_acceptable_mcc, regardless of whether a larger k scores
-        higher. Use this when you have a wide k_values range and want the
-        lightest model that's merely "good enough", not the best performer.
-
-      - "auto" (default): backward-compatible behaviour — uses "floor" if
-        min_acceptable_mcc is set, otherwise "elbow" (smallest k within
-        0.02 MCC of the best MCC in the sweep — chases the ceiling first,
-        then economizes slightly).
-
-    Either way, look at the full table yourself before deciding — the
-    returned suggestion is a starting point, not a verdict. A Pareto-
-    frontier view (which k values are not dominated by any other k on
-    BOTH MCC and latency simultaneously) is always printed regardless of
-    selection_mode, since that's the most honest picture of the tradeoff.
-    """
     rows = []
     for k in k_values:
         print(f"\n{'#'*60}\n  FEATURE COUNT SWEEP: k = {k}\n{'#'*60}")
@@ -1238,10 +1079,6 @@ def run_feature_count_sweep(
         bench = benchmark_model(model, input_size, label=f"k={k}")
 
         # Efficiency = MCC achieved per millisecond of inference latency.
-        # Rewards k values that get good performance WITHOUT paying for it
-        # in latency, unlike "best" which ignores cost entirely. Guard
-        # against divide-by-zero / negative MCC producing a meaningless
-        # negative-latency-adjusted score.
         mcc_val = eval_result["mcc"]
         latency_val = bench["latency_ms"]
         efficiency = (max(mcc_val, 0.0) / latency_val) if latency_val > 0 else 0.0
@@ -1262,14 +1099,11 @@ def run_feature_count_sweep(
     print(f"\n{'='*60}\n  FEATURE COUNT SWEEP SUMMARY\n{'='*60}")
     print(df.to_string(index=False))
     # Sorted by size ascending too, so the size/accuracy tradeoff is visible
-    # at a glance regardless of which selection mode is used below.
     print(f"\n  Sorted by Model Size (lightest first):")
     print(df.sort_values("Model Size (KB)").to_string(index=False))
 
     # Pareto frontier: a k is "dominated" if some OTHER k has both >= MCC
-    # AND <= latency (i.e. that other k is strictly better or equal on
-    # both axes). Non-dominated k values are the honest set of real
-    # tradeoff options — printed regardless of selection_mode.
+    # AND <= latency (i.e. that other k is strictly better or equal on both axes)
     is_dominated = []
     for _, row in df.iterrows():
         dominated = ((df["MCC"] >= row["MCC"]) & (df["Latency (ms/sample)"] < row["Latency (ms/sample)"])).any() or \
@@ -1288,7 +1122,7 @@ def run_feature_count_sweep(
 
     if resolved_mode == "best":
         # Pure best-performer: ignores latency/size entirely. Will tend to
-        # pick the largest k in your range — see docstring warning above.
+        # pick the largest k in the range
         best_row = df.loc[df["MCC"].idxmax()]
         suggested_k = best_row["k_features"]
         print(f"\n  Best-performer selection: highest MCC among the tested k values (latency NOT considered)")
@@ -1326,15 +1160,11 @@ def run_feature_count_sweep(
                   f"vs best MCC in sweep: {best_mcc:.4f} at k={int(df.loc[df['MCC'].idxmax(), 'k_features'])})")
 
     else:  # "elbow"
-        # Smallest k within 0.02 MCC of the ceiling (scaled down from the
-        # old 1-percentage-point F1 margin, since MCC's -1..+1 range means
-        # a 0.01 gap is proportionally larger than the same gap in F1).
+        # Smallest k within 0.02 MCC of the ceiling
         candidates = df[df["MCC"] >= best_mcc - 0.02].sort_values("k_features")
         suggested_k = candidates.iloc[0]["k_features"]
         print(f"\n  Elbow selection: smallest k within 0.02 of best MCC ({best_mcc:.4f})")
         print(f"  Suggested k: {int(suggested_k)}")
-
-    print("  (This is a starting point, not an automatic answer — review the full table above.)")
 
     df.to_csv("feature_count_sweep_results.csv", index=False)
     print("\nSweep results saved to: feature_count_sweep_results.csv")
@@ -1342,7 +1172,7 @@ def run_feature_count_sweep(
 
 
 # =============================================================================
-# 8c. ABLATION STUDY — one table covering all four research gaps
+# 8c. ABLATION STUDY : one table covering all four research gaps
 # =============================================================================
 
 def run_ablation_study(
@@ -1364,17 +1194,14 @@ def run_ablation_study(
       1. Baseline           — no client selection, no conditional updates,
                               no compression, no pruning
       2. + Comm. reduction  — client_fraction=0.7, conditional updates,
-                              fp16 update compression (research gap #1)
+                              fp16 update compression
       3. + Pruning          — baseline + post-hoc magnitude pruning,
-                              fine-tuned (research gap #2)
+                              fine-tuned
       4. All combined       — comm. reduction + pruning together
-                              (the number to actually report as your
-                              headline "lightweight + low-communication" result)
-
+                            
     Reports, per config: final test accuracy, rounds-to-converge (the round
     that produced the best validation model), total KB "sent" over the
-    whole run, total/non-zero parameter count, and CPU inference latency —
-    i.e. one row per research gap, directly comparable.
+    whole run, total/non-zero parameter count, and CPU inference latency
     """
     configs = {
         "1. Baseline":          dict(client_fraction=1.0, conditional_update_delta=0.0, quantize_updates=False, prune=False),
@@ -1463,13 +1290,7 @@ def leave_one_device_out_eval(
     Leave-one-device-out (LODO) generalization test.
 
     For each device, trains a federated model using ONLY the other 8
-    devices as clients, then evaluates on the held-out device's FULL data
-    (its train + test loaders combined — none of it was used in training
-    at all). This is a much stronger check than an in-device random split:
-    it asks whether the model generalizes to a device it has never seen,
-    which is the real claim behind "FedProx handles non-IID heterogeneity"
-    — a within-device train/test split can't tell you that on its own.
-
+    devices as clients, then evaluates on the held-out device's FULL data.
     Returns {device_name: held_out_accuracy}.
     """
     results = {}
@@ -1537,13 +1358,7 @@ def plot_convergence(
     Plot round-by-round convergence for FedAvg and FedProx.
 
     If train-accuracy histories are supplied, they're plotted as dashed
-    lines alongside the test curves — the gap between dashed (train) and
-    solid (test) is the actual overfitting signal. A flat test curve on
-    its own does not show overfitting; it only shows the model reached a
-    plateau, which can equally mean underfitting or a low learning rate.
-
-    Saves the figure to disk so it can be inspected even when running in a
-    headless terminal session.
+    lines alongside the test curves.
     """
     rounds = range(1, max(len(fedavg_history), len(fedprox_history)) + 1)
 
@@ -1579,29 +1394,16 @@ def plot_convergence(
 def main():
     # ------------------------------------------------------------------
     # STEP 1: Load the dataset.
-    #
-    # If the N-BaIoT folder exists on this computer, we use the real
-    # data. Otherwise, we generate fake ("synthetic") data so the script
-    # can still be tested without needing the real dataset downloaded.
     # ------------------------------------------------------------------
     use_real_data = DATASET_ROOT.exists()
 
-    # How many of the 115 original features to keep after feature
-    # selection. Fewer features = a smaller, faster ("lightweight") model,
-    # but too few can hurt accuracy. This number should be chosen using
-    # feature_sweep.py (a separate script), not guessed — run that script
-    # once, look at its results table, then set this number here.
+    # How many of the 115 original features to keep after feature selection. 
     K_BEST_FEATURES = 60
 
     # How to split each device's data into "train" and "test" portions:
-    #   "random" — shuffle the rows randomly before splitting (default)
-    #   "time"   — keep the original row order; first rows = train, last
-    #              rows = test. Useful for checking that "random" isn't
-    #              accidentally leaking very similar rows across the split.
     SPLIT_STRATEGY = "random"
 
     if use_real_data:
-        print("Real N-BaIoT dataset found — loading...")
         train_loaders, test_loaders, scaler, selected_idx, device_names = load_nbaiot_federated(
             dataset_root=DATASET_ROOT,
             max_samples_per_device=5000,
@@ -1612,32 +1414,14 @@ def main():
         input_size = len(selected_idx)
     else:
         print(f"N-BaIoT dataset not found at '{DATASET_ROOT}'.")
-        print("Running with FAKE (synthetic) data instead, just so the script can still run.\n")
-        print(f"  To use the real dataset: put the N-BaIoT folder at '{DATASET_ROOT}'\n")
-        train_loaders, test_loaders = make_synthetic_noniid_loaders(
-            num_clients=9, input_size=115, samples_per_client=1000
-        )
-        device_names = [f"Device_{i+1}" for i in range(len(train_loaders))]
-        input_size = 115
+        # train_loaders, test_loaders = make_synthetic_noniid_loaders(
+        #     num_clients=9, input_size=115, samples_per_client=1000
+        # )
+        # device_names = [f"Device_{i+1}" for i in range(len(train_loaders))]
+        # input_size = 115
 
     num_clients = len(train_loaders)
 
-    # ------------------------------------------------------------------
-    # Shared hyperparameters
-    #
-    # client_fraction / conditional_update_delta / quantize_updates
-    # implement the "Communication Cost Reduction" goal:
-    #   - client_fraction < 1.0   -> only a sampled subset of clients
-    #                                train + upload each round
-    #                                (the "top 20 of 100 devices" idea —
-    #                                 with 9 real devices this samples a
-    #                                 subset of 9; see note below if you
-    #                                 want a literal 100-client simulation)
-    #   - conditional_update_delta -> a client's update is dropped if its
-    #                                local loss didn't improve enough
-    #   - quantize_updates         -> simulates fp16 compression on the
-    #                                uplink before server aggregation
-    # ------------------------------------------------------------------
     CONFIG = dict(
         input_size   = input_size,
         hidden_size  = 20,
@@ -1663,14 +1447,14 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Run FedProx  (μ = 0.01 — good starting point for N-BaIoT)
+    # Run FedProx
     # ------------------------------------------------------------------
     fedprox_model, fedprox_acc, fedprox_train_acc, fedprox_stats = run_federated_learning(
         algorithm="fedprox",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
         device_names=device_names,
-        mu=0.005,        # <-- tune this: try 0.001, 0.01, 0.05, 0.1
+        mu=0.005,   
         **CONFIG,
     )
 
@@ -1712,9 +1496,7 @@ def main():
                                  target_names=["Benign", "Malicious"]))
 
     # ------------------------------------------------------------------
-    # Lightweight Model Design — prune the best (FedProx) model and
-    # benchmark it against the unpruned version, per the slide's
-    # "run inference on Raspberry Pi-class hardware" target.
+    # Lightweight Model Design
     # ------------------------------------------------------------------
     print("\n" + "="*60)
     print("  MODEL PRUNING — Lightweight Model Design")
@@ -1740,9 +1522,7 @@ def main():
     print("\nModels saved: fedavg_model.pt  |  fedprox_model.pt  |  fedprox_model_pruned.pt")
 
     # ------------------------------------------------------------------
-    # Ablation table — one row per research gap (comm. reduction,
-    # lightweight design, both combined), directly comparable numbers
-    # for the dissertation results section.
+    # Ablation table
     # ------------------------------------------------------------------
     ablation_df = run_ablation_study(
         train_loaders, test_loaders, device_names, input_size,
@@ -1756,9 +1536,7 @@ def main():
     print("\nAblation table saved to: ablation_results.csv")
 
     # ------------------------------------------------------------------
-    # Leave-one-device-out generalization test — the real evidence for
-    # the "FedProx handles non-IID heterogeneity" claim: does the model
-    # transfer to a device it has never trained on at all?
+    # Leave-one-device-out generalization test
     # ------------------------------------------------------------------
     lodo_results = leave_one_device_out_eval(
         train_loaders, test_loaders, device_names, input_size,
