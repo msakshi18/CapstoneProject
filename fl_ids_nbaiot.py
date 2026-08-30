@@ -1383,9 +1383,6 @@ def leave_one_device_out_eval(
         total_accuracy += accuracy
     avg_acc = total_accuracy / len(results)
     print(f"\n  Average held-out accuracy: {avg_acc:.4f}")
-    print("  (Compare this to your in-device test accuracy. If it's close, the model")
-    print("   genuinely generalizes across devices. If it's much lower, the model is")
-    print("   fitting per-device quirks rather than transferable attack signatures.)")
     return results
 
 
