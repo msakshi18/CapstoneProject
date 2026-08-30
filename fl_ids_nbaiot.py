@@ -34,7 +34,7 @@ DEVICE_FOLDERS = [
     "SimpleHome_XCS7_1003_WHT_Security_Camera",
 ]
 
-
+# Split a single device's data into train/test portions, either randomly or by time order
 def _split_device(
     X: np.ndarray,
     y: np.ndarray,
@@ -42,50 +42,57 @@ def _split_device(
     random_state: int,
     split_strategy: str = "random",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    
+
+    # time split: keep the first (1-test_size) portion of rows for training, the last test_size portion for testing
     if split_strategy == "time":
         n = len(X)
         split_at = int(n * (1 - test_size))
-        return X[:split_at], X[split_at:], y[:split_at], y[split_at:]
+        return X[:split_at], X[split_at:], y[:split_at], y[split_at:] # x train, x_test, y_train, y_test
     return train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-
+# check for train/test leakage by looking for exact duplicates and near-duplicates between the two sets.
+# Returns a report dict with counts and rates per client.
 def check_train_test_leakage(
-    train_features: list[np.ndarray],
+    train_features: list[np.ndarray], # list of 2D arrays, one per client
     test_features: list[np.ndarray],
-    client_names: list[str],
-    near_dup_distance: float = 1e-3,
-    max_test_samples_checked: int = 3000,
+    client_names: list[str], # list of client names corresponding to the above lists
+    near_dup_distance: float = 1e-3, # threshold for considering two rows "near-duplicates" (Euclidean distance)
+    max_test_samples_checked: int = 3000, # maximum number of test rows to check for near-duplicates (to keep runtime reasonable)
     random_state: int = 42,
 ) -> dict:
-    print("\n" + "=" * 60)
     print("  TRAIN/TEST LEAKAGE CHECK")
     print("=" * 60)
-    rng = np.random.RandomState(random_state)
+    rng = np.random.RandomState(random_state) 
     report = {}
 
     #name, X_tr, X_te = client_names[0], train_features[0], test_features[0]
     for name, X_tr, X_te in zip(client_names, train_features, test_features):
-        if len(X_tr) == 0 or len(X_te) == 0:
+        if len(X_tr) == 0 or len(X_te) == 0: # skip empty datasets
             continue
 
-        # Exact duplicates: hash each row, check membership.
-        train_row_set = {tuple(row) for row in X_tr}
-        exact_dupes = sum(1 for row in X_te if tuple(row) in train_row_set)
+        # Convert each training row to a tuple so Python can store it in a set.
+        train_row_set = set()
+        for row in X_tr:
+            train_row_set.add(tuple(row))
+        exact_dupes = 0
+        for row in X_te:
+            if tuple(row) in train_row_set:
+                exact_dupes += 1
 
-        # Near-duplicates via nearest-neighbour distance.
-        if len(X_te) > max_test_samples_checked:
-            sample_idx = rng.choice(len(X_te), max_test_samples_checked, replace=False)
+        # Near-duplicates via nearest-neighbour distance
+        # Sampling test set
+        if len(X_te) > max_test_samples_checked: # If there are more test rows than the limit, it randomly selects up to 3,000 rows
+            sample_idx = rng.choice(len(X_te), max_test_samples_checked, replace=False) # randomly sample test rows to check for near-duplicates
             test_sample = X_te[sample_idx]
         else:
             test_sample = X_te
 
         # KD-tree query is fast even on large train sets, so we can afford to
-        # check every test row for its nearest neighbour in the train set.
+        # check every test row for its nearest neighbour in the train set
         tree = cKDTree(X_tr)
-        dists, _ = tree.query(test_sample, k=1)
+        dists, _ = tree.query(test_sample, k=1) # finds the closest training row for each test row
         near_dupes = int((dists < near_dup_distance).sum())
         near_dupe_rate = near_dupes / len(test_sample)
 
@@ -102,15 +109,18 @@ def check_train_test_leakage(
         print(f"    {name:<45} exact: {exact_dupes:>4}  |  near-dupes: {near_dupes:>4}/{len(test_sample)} "
               f"({near_dupe_rate:.1%}){flag}")
 
-    total_near = sum(r["near_duplicates"] for r in report.values())
-    total_checked = sum(r["test_rows_checked"] for r in report.values())
-    total_exact = sum(r["exact_duplicates"] for r in report.values())
+    total_near = 0
+    total_checked = 0
+    total_exact = 0
+    for result in report.values():
+        total_near += result["near_duplicates"]
+        total_checked += result["test_rows_checked"]
+        total_exact += result["exact_duplicates"]
     overall_rate = total_near / total_checked if total_checked else 0.0
     print(f"\n  Overall: {total_exact} exact duplicates, "
           f"{total_near}/{total_checked} near-duplicates ({overall_rate:.1%})")
     if total_exact > 0 or overall_rate > 0.05:
-        print("  -> Meaningful leakage risk. Consider split_strategy='time' or "
-              "leave-one-device-out evaluation before trusting accuracy numbers.")
+        print("  -> Leakage risk.")
     else:
         print("  -> No strong leakage signal from this check.")
     return report
@@ -123,7 +133,7 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
     """
     dfs = []
 
-    # Benign traffic
+    # Normal traffic
     benign_dir = device_path / "benign"
     if benign_dir.exists():
         for csv_file in benign_dir.glob("*.csv"):
@@ -148,14 +158,20 @@ def load_device_data(device_path: Path) -> pd.DataFrame:
             dfs.append(df)
 
     if not dfs:
-        raise FileNotFoundError(f"No CSV files found under {device_path}")
+        raise FileNotFoundError(f"No CSV files found in {device_path}")
 
-    combined = pd.concat(dfs, ignore_index=True)
-    combined = combined.dropna()
+    combined = pd.concat(dfs, ignore_index=True) # combine all dataframes into one
+    combined = combined.dropna() # drop any rows with NA values
 
-    feature_cols = [c for c in combined.columns if c != "label"]
+    # Build a list of feature columns, leaving out the answer column.
+    feature_cols = []
+    for column in combined.columns:
+        if column != "label":
+            feature_cols.append(column)
     n_before = len(combined)
-    dup_mask = combined[feature_cols].astype(np.float32).duplicated()
+    # Mark repeated feature rows. The first copy is kept and later copies are removed.
+    feature_values = combined[feature_cols].astype(np.float32)
+    dup_mask = feature_values.duplicated()
     combined = combined[~dup_mask]
     n_dropped = int(dup_mask.sum())
     if n_dropped > 0:
@@ -169,8 +185,8 @@ def load_flat_device_data(dataset_root: Path, device_id: str) -> pd.DataFrame:
     """
     Loads flat N-BaIoT CSV files that are named like `1.benign.csv`.
 
-    The workspace copy of the dataset is stored in this layout, so we group
-    files by device prefix and infer the label from the filename.
+    groups by device-ID prefix and infers the label from whether "benign" appears in the filename.
+    Otherwise identical logic to load_device_data.
     """
     dfs = []
     for csv_file in sorted(dataset_root.glob(f"{device_id}.*.csv")):
@@ -182,12 +198,17 @@ def load_flat_device_data(dataset_root: Path, device_id: str) -> pd.DataFrame:
     if not dfs:
         raise FileNotFoundError(f"No CSV files found for device {device_id} under {dataset_root}")
 
-    combined = pd.concat(dfs, ignore_index=True)
+    combined = pd.concat(dfs, ignore_index=True) # ignore_index=True without this it would be 0,1,2,0,1,..
     combined = combined.dropna()
 
-    feature_cols = [c for c in combined.columns if c != "label"]
+    # Build a list of feature columns, leaving out the answer column.
+    feature_cols = []
+    for column in combined.columns:
+        if column != "label":
+            feature_cols.append(column)
     n_before = len(combined)
-    dup_mask = combined[feature_cols].astype(np.float32).duplicated()
+    feature_values = combined[feature_cols].astype(np.float32)
+    dup_mask = feature_values.duplicated()
     combined = combined[~dup_mask]
     n_dropped = int(dup_mask.sum())
     if n_dropped > 0:
@@ -222,14 +243,18 @@ def load_nbaiot_federated(
     test_features, test_labels = [], []
     client_names = []
 
-    folder_devices = [device_name for device_name in DEVICE_FOLDERS if (dataset_root / device_name).exists()]
-    flat_device_ids = sorted(
-        {
-            csv_file.stem.split(".", 1)[0]
-            for csv_file in dataset_root.glob("*.csv")
-            if csv_file.stem.split(".", 1)[0].isdigit()
-        }
-    )
+    # Detect whether the dataset is in foldered or flat format
+    folder_devices = []
+    for device_name in DEVICE_FOLDERS:
+        if (dataset_root / device_name).exists():
+            folder_devices.append(device_name)
+    # Find device IDs from filenames such as "1.benign.csv".
+    flat_device_ids = set()
+    for csv_file in dataset_root.glob("*.csv"):
+        device_id = csv_file.stem.split(".", 1)[0]
+        if device_id.isdigit():
+            flat_device_ids.add(device_id)
+    flat_device_ids = sorted(flat_device_ids)
 
     if folder_devices:
         for device_name in folder_devices:
@@ -237,11 +262,9 @@ def load_nbaiot_federated(
             try:
                 df = load_device_data(device_path)
                 if len(df) > max_samples_per_device:
-                    if split_strategy == "time":
-                        df = df.iloc[:max_samples_per_device]  # keep native row order intact
-                    else:
-                        df = df.sample(n=max_samples_per_device, random_state=random_state)
-                X_dev = df.iloc[:, :-1].values.astype(np.float32)
+                    df = df.sample(n=max_samples_per_device, random_state=random_state)
+                # Remove the label column and keep the remaining values as features.
+                X_dev = df.drop(columns=["label"]).values.astype(np.float32)
                 y_dev = df["label"].values.astype(np.int64)
                 X_tr, X_te, y_tr, y_te = _split_device(
                     X_dev, y_dev, test_size, random_state, split_strategy
@@ -262,11 +285,9 @@ def load_nbaiot_federated(
             try:
                 df = load_flat_device_data(dataset_root, device_id)
                 if len(df) > max_samples_per_device:
-                    if split_strategy == "time":
-                        df = df.iloc[:max_samples_per_device]  # keep native row order intact
-                    else:
-                        df = df.sample(n=max_samples_per_device, random_state=random_state)
-                X_dev = df.iloc[:, :-1].values.astype(np.float32)
+                    df = df.sample(n=max_samples_per_device, random_state=random_state)
+                # Remove the label column and keep the remaining values as features.
+                X_dev = df.drop(columns=["label"]).values.astype(np.float32)
                 y_dev = df["label"].values.astype(np.int64)
                 X_tr, X_te, y_tr, y_te = _split_device(
                     X_dev, y_dev, test_size, random_state, split_strategy
@@ -285,10 +306,10 @@ def load_nbaiot_federated(
     if not train_features:
         raise RuntimeError(
             f"No N-BaIoT data found at '{dataset_root}'.\n"
-            "Please download the dataset and set DATASET_ROOT correctly."
         )
 
     # Fit scaler/selector on TRAINING data only to avoid leakage into the test split.
+    # Put all clients' training rows into one large training set.
     X_train_all = np.vstack(train_features)
     y_train_all = np.concatenate(train_labels)
 
@@ -296,7 +317,7 @@ def load_nbaiot_federated(
     # Leakage check on the RAW feature space (before any reduction)
     # ------------------------------------------------------------------
     if check_leakage:
-        print("\n[Leakage check — RAW 115-feature space, before feature selection]")
+        print("\nLeakage check before feature selection:")
         check_train_test_leakage(train_features, test_features, client_names)
 
     # ------------------------------------------------------------------
@@ -306,23 +327,33 @@ def load_nbaiot_federated(
     # the retained columns for the models. This is what shrinks the model
     # for lightweight / Raspberry-Pi-class inference.
     # ------------------------------------------------------------------
+    # Start by assuming that every feature will be kept.
     selected_idx = list(range(X_train_all.shape[1]))
     if k_best_features is not None and k_best_features < X_train_all.shape[1]:
         minmax = MinMaxScaler()
         X_train_nonneg = minmax.fit_transform(X_train_all)
         selector = SelectKBest(score_func=chi2, k=k_best_features)
         selector.fit(X_train_nonneg, y_train_all)
-        selected_idx = np.where(selector.get_support())[0].tolist()
+        selected_idx = []
+        feature_support = selector.get_support()
+        for index, is_selected in enumerate(feature_support):
+            if is_selected:
+                selected_idx.append(index)
         print(f"\nChi-squared feature selection: {X_train_all.shape[1]} -> {len(selected_idx)} features")
 
-        train_features = [X[:, selected_idx] for X in train_features]
-        test_features  = [X[:, selected_idx] for X in test_features]
+        # Keep only the selected columns for every client's data.
+        reduced_train_features = []
+        reduced_test_features = []
+        for X in train_features:
+            reduced_train_features.append(X[:, selected_idx])
+        for X in test_features:
+            reduced_test_features.append(X[:, selected_idx])
+        train_features = reduced_train_features
+        test_features = reduced_test_features
         X_train_all = np.vstack(train_features)
 
         if check_leakage:
-            print(f"\n[Leakage check — reduced {len(selected_idx)}-feature space, for comparison only]")
-            print("(Higher numbers here than above are expected and are NOT extra real leakage —")
-            print(" they're coincidental collisions caused by dropping redundant columns.)")
+            print(f"\nLeakage check after feature selection:")
             check_train_test_leakage(train_features, test_features, client_names)
 
     scaler = StandardScaler()
@@ -379,6 +410,7 @@ def split_train_validation_loaders(
             train_size = dataset_size - 1
             val_size = 1
 
+        # Create a repeatable random order so this client's data can be split.
         generator = torch.Generator().manual_seed(random_state + client_idx)
         permutation = torch.randperm(dataset_size, generator=generator).tolist()
         train_indices = permutation[:train_size]
@@ -392,66 +424,6 @@ def split_train_validation_loaders(
         val_loaders.append(DataLoader(val_subset, batch_size=batch_size, shuffle=False))
 
     return train_sub_loaders, val_loaders
-
-
-# # =============================================================================
-# # 2. DEMO / SYNTHETIC DATA (i used it to test the code before the real dataset for
-# #  quicker development and testing)
-# # =============================================================================
-
-# def make_synthetic_noniid_loaders(
-#     num_clients: int = 9,
-#     input_size: int = 115,
-#     num_classes: int = 2,
-#     samples_per_client: int = 1000,
-#     random_state: int = 42,
-# ) -> tuple[list[DataLoader], list[DataLoader]]:
-#     """
-#     Synthetic Non-IID data that mimics the N-BaIoT heterogeneity:
-#       - Each device has a different class-imbalance ratio
-#         (some cameras mostly see attacks; thermostats mostly benign)
-#       - Feature distributions are shifted per device
-
-#     Use this for development/testing before the real dataset is available.
-#     """
-#     np.random.seed(random_state)
-#     torch.manual_seed(random_state)
-
-#     # Create attack ratios for each client (0.05 to 0.95)
-#     attack_ratios = np.linspace(0.05, 0.95, num_clients)
-
-#     train_loaders, test_loaders = [], []
-
-
-#     for i in range(num_clients):
-#         ratio = attack_ratios[i]
-#         n_attack = int(samples_per_client * ratio)
-#         n_benign = samples_per_client - n_attack
-
-#         # Device-specific feature shift simulates different traffic patterns
-#         device_shift = np.random.randn(input_size).astype(np.float32) * 0.5
-
-#         benign_feat = np.random.randn(n_benign, input_size).astype(np.float32) + device_shift
-#         attack_feat = np.random.randn(n_attack, input_size).astype(np.float32) + device_shift + 1.5
-
-#         X = np.vstack([benign_feat, attack_feat])
-#         y = np.array([0] * n_benign + [1] * n_attack, dtype=np.int64)
-
-#         perm = np.random.permutation(len(y))
-#         X, y = X[perm], y[perm]
-
-#         X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=random_state)
-
-#         train_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
-#         test_ds  = TensorDataset(torch.tensor(X_te),  torch.tensor(y_te))
-
-#         train_loaders.append(DataLoader(train_ds, batch_size=64, shuffle=True))
-#         test_loaders.append(DataLoader(test_ds,  batch_size=64, shuffle=False))
-
-#     print(f"[Synthetic Non-IID] Created {num_clients} clients with varying attack ratios.")
-#     print(f"  Attack ratios: {[f'{r:.2f}' for r in attack_ratios]}")
-#     return train_loaders, test_loaders
-
 
 # =============================================================================
 # 3. MODEL — Lightweight MLP (IoT-suitable)
@@ -495,10 +467,17 @@ def compute_class_weights(loader: DataLoader, num_classes: int = 2) -> torch.Ten
     1.0) if a class is entirely absent from this client's local data,
     since a weight can't meaningfully compensate for zero examples.
     """
-    all_targets = torch.cat([target for _, target in loader])
+    # Collect all labels from this client so we can count each class.
+    target_batches = []
+    for _, target in loader:
+        target_batches.append(target)
+    all_targets = torch.cat(target_batches)
     counts = torch.bincount(all_targets, minlength=num_classes).float()
     if (counts == 0).any():
+        # If a class is missing, there is no useful way to up-weight it.
         return torch.ones(num_classes)
+
+    # Give less common classes a larger loss weight.
     weights = len(all_targets) / (num_classes * counts)
     return weights
 
@@ -577,10 +556,10 @@ def client_update_fedprox(
     client_model.train()
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    global_params = {
-        name: param.detach().clone()
-        for name, param in global_model.named_parameters()
-    }
+    # Save an unchanged copy of the global parameters before local training.
+    global_params = {}
+    for name, param in global_model.named_parameters():
+        global_params[name] = param.detach().clone()
 
     initial_loss, final_loss = None, None
 
@@ -596,6 +575,7 @@ def client_update_fedprox(
             # ||w_local - w_global||^2  (summed across all parameters)
             prox_loss = torch.tensor(0.0)
             for name, param in client_model.named_parameters():
+                # Measure how far this local parameter moved from the global one.
                 prox_loss = prox_loss + torch.norm(param - global_params[name]) ** 2
 
             loss = task_loss + (mu / 2.0) * prox_loss
@@ -625,12 +605,18 @@ def quantize_state_dict(state_dict: dict, dtype: torch.dtype = torch.float16) ->
     wire size changes. Returns the quantised dict plus nothing else; use
     `state_dict_size_bytes` to measure the before/after payload.
     """
-    return {k: v.to(dtype) for k, v in state_dict.items()}
+    quantized_state = {}
+    for key, value in state_dict.items():
+        quantized_state[key] = value.to(dtype)
+    return quantized_state
 
 
 def state_dict_size_bytes(state_dict: dict) -> int:
     """Rough payload size (bytes) of a state_dict, for compression reporting."""
-    return sum(v.element_size() * v.nelement() for v in state_dict.values())
+    total_bytes = 0
+    for value in state_dict.values():
+        total_bytes += value.element_size() * value.nelement()
+    return total_bytes
 
 
 def server_aggregate(
@@ -648,12 +634,16 @@ def server_aggregate(
         client_sizes = [1] * len(client_weights)
 
     total_size = float(sum(client_sizes))
-    client_scalars = [size / total_size for size in client_sizes]
+    client_scalars = []
+    for size in client_sizes:
+        client_scalars.append(size / total_size)
 
     for k in global_dict.keys():
         aggregated = torch.zeros_like(global_dict[k], dtype=torch.float32)
         for client_state, scalar in zip(client_weights, client_scalars):
-            aggregated += client_state[k].float() * scalar
+            # A client with more training rows contributes more to the average.
+            client_contribution = client_state[k].float() * scalar
+            aggregated += client_contribution
         global_dict[k] = aggregated.to(global_dict[k].dtype)
     global_model.load_state_dict(global_dict)
     return global_model
@@ -698,7 +688,12 @@ def evaluate_global_model(
             if verbose:
                 print(f"    {name:<45} Acc: {acc:.4f}")
 
-    overall_acc = sum(p == t for p, t in zip(all_preds, all_targets)) / len(all_targets)
+    # Calculate accuracy across every test row from every client.
+    correct_predictions = 0
+    for prediction, target in zip(all_preds, all_targets):
+        if prediction == target:
+            correct_predictions += 1
+    overall_acc = correct_predictions / len(all_targets) if all_targets else 0.0
     
     macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
     # MCC (Matthews Correlation Coefficient) uses all four confusion-matrix
@@ -788,7 +783,9 @@ def run_federated_learning(
         # With client_fraction=1.0 (default) all clients participate,
         # matching the original 9-device behaviour.
 
-        n_selected = max(1, int(round(num_clients * client_fraction)))
+        requested_clients = int(round(num_clients * client_fraction))
+        # Always train with at least one client, even for a small fraction.
+        n_selected = max(1, requested_clients)
         rng = np.random.RandomState(random_state + round_idx)
         selected_clients = sorted(rng.choice(num_clients, size=n_selected, replace=False).tolist())
 
@@ -806,7 +803,9 @@ def run_federated_learning(
                 weight_decay=weight_decay,
             )
 
-            class_weights = compute_class_weights(train_loaders[i], num_classes) if use_class_weights else None
+            class_weights = None
+            if use_class_weights:
+                class_weights = compute_class_weights(train_loaders[i], num_classes)
 
             if algorithm == "fedavg":
                 weights, loss_before, loss_after = client_update_fedavg(
@@ -819,16 +818,29 @@ def run_federated_learning(
                     epochs=local_epochs, mu=mu, class_weights=class_weights,
                 )
 
-            improvement = (loss_before or 0.0) - (loss_after or 0.0)
+            # Compare the first and last local losses before deciding to send an update.
+            if loss_before is None:
+                loss_before_value = 0.0
+            else:
+                loss_before_value = loss_before
+            if loss_after is None:
+                loss_after_value = 0.0
+            else:
+                loss_after_value = loss_after
+            improvement = loss_before_value - loss_after_value
             if conditional_update_delta > 0 and improvement < conditional_update_delta:
                 skipped_clients += 1
                 continue
 
             bytes_before += state_dict_size_bytes(weights)
             if quantize_updates:
-                weights = quantize_state_dict(weights)          # fp32 -> fp16 ("on the wire")
+                # Use smaller numbers only while simulating transmission.
+                weights = quantize_state_dict(weights)
                 bytes_after += state_dict_size_bytes(weights)
-                weights = {k: v.float() for k, v in weights.items()}  # upcast back for aggregation
+                restored_weights = {}
+                for key, value in weights.items():
+                    restored_weights[key] = value.float()
+                weights = restored_weights
             else:
                 bytes_after += state_dict_size_bytes(weights)
 
@@ -882,14 +894,16 @@ def run_federated_learning(
             )
             break
 
+    # Restore the model that had the best validation score.
     global_model.load_state_dict(best_model_state)
+    best_test_results = evaluate_global_model(global_model, test_loaders, device_names, verbose=False)
 
     stats = {
         "rounds_run": round_idx + 1,
         "best_round": best_round,          # rounds-to-converge proxy
         "total_bytes_before": total_bytes_before,
         "total_bytes_after": total_bytes_after,
-        "final_test_accuracy": accuracy_history[-1] if accuracy_history else None,
+        "final_test_accuracy": best_test_results["overall_accuracy"],
     }
     return global_model, accuracy_history, train_accuracy_history, stats
 
@@ -978,8 +992,11 @@ def benchmark_model(model: nn.Module, input_size: int, label: str = "") -> dict:
       - Throughput (samples/sec) : the inverse of latency, useful for
         framing as "can this keep up with incoming traffic"
     """
-    total_params = sum(p.numel() for p in model.parameters())
-    nonzero_params = sum((p != 0).sum().item() for p in model.parameters())
+    total_params = 0
+    nonzero_params = 0
+    for parameter in model.parameters():
+        total_params += parameter.numel()
+        nonzero_params += (parameter != 0).sum().item()
     model_size_kb = state_dict_size_bytes(model.state_dict()) / 1024
     flop_stats = compute_model_flops(model)
 
@@ -1056,8 +1073,16 @@ def run_feature_count_sweep(
         print(f"\n{'#'*60}\n  FEATURE COUNT SWEEP: k = {k}\n{'#'*60}")
         kwargs = {**loader_kwargs, "k_best_features": k}
         loaded = loader_fn(**kwargs)
-        train_loaders, test_loaders, scaler, selected_idx = loaded[0], loaded[1], loaded[2], loaded[3]
-        device_names = loaded[4] if len(loaded) > 4 else [f"Client_{i+1}" for i in range(len(train_loaders))]
+        train_loaders = loaded[0]
+        test_loaders = loaded[1]
+        scaler = loaded[2]
+        selected_idx = loaded[3]
+        if len(loaded) > 4:
+            device_names = loaded[4]
+        else:
+            device_names = []
+            for client_number in range(len(train_loaders)):
+                device_names.append(f"Client_{client_number + 1}")
         input_size = len(selected_idx)
 
         model, acc_hist, train_hist, stats = run_federated_learning(
@@ -1106,8 +1131,16 @@ def run_feature_count_sweep(
     # AND <= latency (i.e. that other k is strictly better or equal on both axes)
     is_dominated = []
     for _, row in df.iterrows():
-        dominated = ((df["MCC"] >= row["MCC"]) & (df["Latency (ms/sample)"] < row["Latency (ms/sample)"])).any() or \
-                    ((df["MCC"] > row["MCC"]) & (df["Latency (ms/sample)"] <= row["Latency (ms/sample)"])).any()
+        # A value is dominated when another result has better MCC and latency.
+        higher_mcc_and_lower_latency = (
+            (df["MCC"] >= row["MCC"])
+            & (df["Latency (ms/sample)"] < row["Latency (ms/sample)"])
+        ).any()
+        higher_mcc_and_equal_or_lower_latency = (
+            (df["MCC"] > row["MCC"])
+            & (df["Latency (ms/sample)"] <= row["Latency (ms/sample)"])
+        ).any()
+        dominated = higher_mcc_and_lower_latency or higher_mcc_and_equal_or_lower_latency
         is_dominated.append(dominated)
     pareto_df = df[~pd.Series(is_dominated, index=df.index)].sort_values("Latency (ms/sample)")
     print(f"\n  Pareto-optimal k values (MCC vs latency — no other k beats one of these on both axes):")
@@ -1298,9 +1331,15 @@ def leave_one_device_out_eval(
 
     for held_out_idx in range(num_devices):
         held_out_name = device_names[held_out_idx]
-        other_train_loaders = [train_loaders[i] for i in range(num_devices) if i != held_out_idx]
-        other_test_loaders  = [test_loaders[i]  for i in range(num_devices) if i != held_out_idx]
-        other_names = [d for i, d in enumerate(device_names) if i != held_out_idx]
+        # Build training lists that leave this device out completely.
+        other_train_loaders = []
+        other_test_loaders = []
+        other_names = []
+        for device_idx in range(num_devices):
+            if device_idx != held_out_idx:
+                other_train_loaders.append(train_loaders[device_idx])
+                other_test_loaders.append(test_loaders[device_idx])
+                other_names.append(device_names[device_idx])
 
         print(f"\n{'='*60}")
         print(f"  LEAVE-ONE-DEVICE-OUT: holding out {held_out_name} ({held_out_idx + 1}/{num_devices})")
@@ -1322,7 +1361,11 @@ def leave_one_device_out_eval(
         )
 
         # Evaluate on the held-out device's FULL data — genuinely unseen.
-        held_out_full = ConcatDataset([train_loaders[held_out_idx].dataset, test_loaders[held_out_idx].dataset])
+        held_out_datasets = [
+            train_loaders[held_out_idx].dataset,
+            test_loaders[held_out_idx].dataset,
+        ]
+        held_out_full = ConcatDataset(held_out_datasets)
         held_out_loader = DataLoader(held_out_full, batch_size=64, shuffle=False)
 
         eval_result = evaluate_global_model(model, [held_out_loader], [held_out_name], verbose=False)
@@ -1335,7 +1378,10 @@ def leave_one_device_out_eval(
     print(f"{'='*60}")
     for name, acc in results.items():
         print(f"    {name:<45} {acc:.4f}")
-    avg_acc = sum(results.values()) / len(results)
+    total_accuracy = 0.0
+    for accuracy in results.values():
+        total_accuracy += accuracy
+    avg_acc = total_accuracy / len(results)
     print(f"\n  Average held-out accuracy: {avg_acc:.4f}")
     print("  (Compare this to your in-device test accuracy. If it's close, the model")
     print("   genuinely generalizes across devices. If it's much lower, the model is")
@@ -1395,7 +1441,6 @@ def main():
     # ------------------------------------------------------------------
     # STEP 1: Load the dataset.
     # ------------------------------------------------------------------
-    use_real_data = DATASET_ROOT.exists()
 
     # How many of the 115 original features to keep after feature selection. 
     K_BEST_FEATURES = 60
@@ -1403,24 +1448,14 @@ def main():
     # How to split each device's data into "train" and "test" portions:
     SPLIT_STRATEGY = "random"
 
-    if use_real_data:
-        train_loaders, test_loaders, scaler, selected_idx, device_names = load_nbaiot_federated(
-            dataset_root=DATASET_ROOT,
-            max_samples_per_device=5000,
-            k_best_features=K_BEST_FEATURES,
-            split_strategy=SPLIT_STRATEGY,
-            check_leakage=True,
-        )
-        input_size = len(selected_idx)
-    else:
-        print(f"N-BaIoT dataset not found at '{DATASET_ROOT}'.")
-        # train_loaders, test_loaders = make_synthetic_noniid_loaders(
-        #     num_clients=9, input_size=115, samples_per_client=1000
-        # )
-        # device_names = [f"Device_{i+1}" for i in range(len(train_loaders))]
-        # input_size = 115
-
-    num_clients = len(train_loaders)
+    train_loaders, test_loaders, scaler, selected_idx, device_names = load_nbaiot_federated(
+        dataset_root=DATASET_ROOT,
+        max_samples_per_device=5000,
+        k_best_features=K_BEST_FEATURES,
+        split_strategy=SPLIT_STRATEGY,
+        check_leakage=True,
+    )
+    input_size = len(selected_idx)
 
     CONFIG = dict(
         input_size   = input_size,
@@ -1442,8 +1477,17 @@ def main():
         algorithm="fedavg",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
+        input_size=CONFIG["input_size"],
+        hidden_size=CONFIG["hidden_size"],
+        num_classes=CONFIG["num_classes"],
+        num_rounds=CONFIG["num_rounds"],
+        local_epochs=CONFIG["local_epochs"],
+        lr=CONFIG["lr"],
+        weight_decay=CONFIG["weight_decay"],
         device_names=device_names,
-        **CONFIG,
+        client_fraction=CONFIG["client_fraction"],
+        conditional_update_delta=CONFIG["conditional_update_delta"],
+        quantize_updates=CONFIG["quantize_updates"],
     )
 
     # ------------------------------------------------------------------
@@ -1453,9 +1497,18 @@ def main():
         algorithm="fedprox",
         train_loaders=train_loaders,
         test_loaders=test_loaders,
+        input_size=CONFIG["input_size"],
+        hidden_size=CONFIG["hidden_size"],
+        num_classes=CONFIG["num_classes"],
+        num_rounds=CONFIG["num_rounds"],
+        local_epochs=CONFIG["local_epochs"],
+        lr=CONFIG["lr"],
+        weight_decay=CONFIG["weight_decay"],
         device_names=device_names,
         mu=0.005,   
-        **CONFIG,
+        client_fraction=CONFIG["client_fraction"],
+        conditional_update_delta=CONFIG["conditional_update_delta"],
+        quantize_updates=CONFIG["quantize_updates"],
     )
 
     # ------------------------------------------------------------------
@@ -1546,9 +1599,13 @@ def main():
         lr=CONFIG["lr"],
         weight_decay=CONFIG["weight_decay"],
     )
-    pd.DataFrame(
-        [{"device": k, "held_out_accuracy": v} for k, v in lodo_results.items()]
-    ).to_csv("leave_one_device_out_results.csv", index=False)
+    lodo_rows = []
+    for device, accuracy in lodo_results.items():
+        lodo_rows.append({
+            "device": device,
+            "held_out_accuracy": accuracy,
+        })
+    pd.DataFrame(lodo_rows).to_csv("leave_one_device_out_results.csv", index=False)
     print("\nLODO results saved to: leave_one_device_out_results.csv")
 
 
