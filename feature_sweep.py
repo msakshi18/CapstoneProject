@@ -34,7 +34,7 @@ def main():
         loader_kwargs=dict(
             dataset_root=DATASET_ROOT,
             max_samples_per_device=5000,
-            check_leakage=False,  # the leakage check is not needed here; run fl_ids_nbaiot.py separately for that
+            check_leakage=False,  # the leakage check is not needed here; running fl_ids_nbaiot.py separately for that
         ),
         k_values=K_SWEEP_VALUES,
         num_rounds=K_SWEEP_ROUNDS,
@@ -45,8 +45,6 @@ def main():
     print(f"\n{'='*60}")
     print(f"  DONE.")
     print(f"  Suggested K_BEST_FEATURES = {suggested_k}")
-    print(f"  Now go update that number in fl_ids_nbaiot.py's main() function.")
-    print(f"  (Read the table above first — don't just trust this number blindly.)")
     print(f"{'='*60}")
 
 
