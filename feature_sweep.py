@@ -14,18 +14,8 @@ K_SWEEP_VALUES = [50,60,65,70,75]
 K_SWEEP_ROUNDS = 5
 
 #   "efficiency" — picks the feature count that gives the best performance
-#                  PER MILLISECOND of processing time. Recommended if you
-#                  care about keeping the model fast/lightweight.
-#
-#   "best"       — picks whichever feature count scores the highest (MCC),
-#                  ignoring speed completely. Note: this will usually pick
-#                  the LARGEST number in K_SWEEP_VALUES, since more
-#                  features almost always helps accuracy a little, even if
-#                  it makes the model slower.
-#
-#   "floor"      — picks the SMALLEST feature count that is "good enough"
-#                  (scores at least MIN_ACCEPTABLE_MCC below), even if a
-#                  bigger number would score higher.
+#                  PER MILLISECOND of processing time.
+
 SELECTION_MODE = "efficiency"
 
 MIN_ACCEPTABLE_MCC = 0.7
